@@ -1,18 +1,4 @@
-# =====================================================================
-# YT-Only Worker — Cloudflare Wrangler config
-#
-# Deploy:
-#   npx wrangler deploy
-#
-# First-time setup:
-#   npx wrangler login
-#
-# After deploy, copy the worker URL printed in the terminal (looks like
-# https://yt-only.<your-subdomain>.workers.dev) and paste it into index.html
-# at the top of the <script> block (WORKER_URL).
-# =====================================================================
-
 name = "youwork"
 main = "worker.js"
-compatibility_date = "2026-9-05"
+compatibility_date = "2026-9-06"
 
