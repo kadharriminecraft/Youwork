@@ -1,4 +1,4 @@
-name = "youwork"
+name = "Youwork"
 main = "worker.js"
 compatibility_date = "2026-9-06"
-
+compatibility_flags = ["nodejs_compat"]
