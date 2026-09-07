@@ -1,5 +1,5 @@
 /* =====================================================================
-   YT-ONLY WORKER v1.5 — a dedicated Cloudflare Worker purpose-built for
+   YT-ONLY WORKER v1.6 — a dedicated Cloudflare Worker purpose-built for
    the YT-Only app (the stripped-down YouTube-only player).
 
    Deploy on YOUR Cloudflare account (free tier is fine):
@@ -9,7 +9,7 @@
      4. In the app: Settings (gear) → paste the URL → Save → Test connection
 
    What this worker does:
-     - /__yt/health           → version probe ("yt-only-ok/1.5")
+     - /__yt/health           → version probe ("yt-only-ok/1.6")
      - /__yt/search?q=QUERY   → JSON { videos:[...], channels:[...] }
        v1.5: three sources RACE IN PARALLEL (innertube ANDROID_VR API +
        HTML scrape + Piped) — fast AND throttle-proof.
@@ -17,6 +17,10 @@
        v1.5: watch scrape + innertube player + Piped race in parallel.
      - /__yt/home             → JSON { videos:[...] } (popular feed)
      - /__yt/channel?id=|handle= → JSON { header, videos:[...] }
+       v1.6: ABSOLUTE-LATEST channel videos — innertube /browse (API,
+       newest-first) + the YouTube RSS feed (exact timestamps) raced in
+       parallel with the old scrape + Piped tiers; merged, deduped and
+       epoch-sorted newest-first. Every video carries `published` (ms).
      - /__yt/dl?id=VID&type=audio|video → streams the file through this
        worker (Content-Disposition: attachment) so the browser downloads
        it directly from YOUR worker — no external site needed.
@@ -40,7 +44,27 @@
        land back inside the proxy. The worker root IS the converter:
        just open https://YOUR.WORKER/ and ezconv appears, unblocked.
 
-   WHAT CHANGED IN v1.5 (fast reliable search/metadata + in-app downloads):
+   WHAT CHANGED IN v1.6 (absolute-latest channel videos):
+     1. CHANNEL VIDEO FRESHNESS — the old channel endpoint leaned on the
+        HTML scrape (often shelled/429'd to datacenter IPs) and Piped
+        relatedStreams (stale or popular-sorted on many public
+        instances) — so subs/channel pages showed OLDER videos. v1.6
+        adds two API-grade, newest-first sources, all raced in parallel:
+          a) innertube ANDROID_VR /youtubei/v1/browse (videos tab,
+             sort=newest) — the SAME throttle-proof API tier that made
+             v1.5 search fast; ~30 latest videos w/ views+dates.
+          b) YouTube RSS feed /feeds/videos.xml?channel_id=… — the 15
+             ABSOLUTE LATEST uploads with EXACT publish timestamps
+             (this is what RSS readers use; not throttled, ~200ms).
+        The scrape + Piped stay as parallel fallbacks; videos are merged
+        + deduped by id, every card gets a `published` epoch (RSS exact,
+        relative texts parsed otherwise), and the list is sorted
+        NEWEST-FIRST before responding. The app's Subscriptions tab
+        uses this to show the true latest from every subscribed channel.
+     2. Download filename passthrough on /__ezdl verified end-to-end
+        (no worker change needed — frontend v1.6 drives native save-as).
+
+  WHAT CHANGED IN v1.5 (fast reliable search/metadata + in-app downloads):
      1. SEARCH IS RACED, NOT SEQUENCED. Root cause of "takes forever and
         shows no results": v1.4 scraped youtube.com/results first — when
         the Worker's datacenter IP is 429-throttled that scrape burns
@@ -149,7 +173,7 @@
    ===================================================================== */
 
 /* ----- version + config -------------------------------------------- */
-const VERSION = '1.5';
+const VERSION = '1.6';
 const HEALTH_TAG = 'yt-only-ok/' + VERSION;
 const YT_HOME = 'https://www.youtube.com';
 
@@ -447,16 +471,21 @@ async function handleRequest(request) {
     }
 
     /* channel page -------------------------------------------------- *
-     * v1.3: two sources run IN PARALLEL and merge:
-     *   - Piped /channel/{id}  → header (name/avatar/banner/desc/subs)
-     *     is reliable even when YouTube shells pages to datacenter IPs.
-     *     (Relay-app architecture.)
-     *   - youtube.com /channel/{id}/videos scrape → the VIDEOS (lockups).
-     *     Channel grids scrape fine from datacenter IPs most of the time
-     *     — it's /watch that gets 429'd hard. When the scrape dies,
-     *     Piped's relatedStreams/nextpage fill in what they can.
+     * v1.6: channels now answer with the ABSOLUTE LATEST uploads,
+     * newest-first. Four tiers run IN PARALLEL and merge:
+     *   1. innertube /browse (ANDROID_VR, videos tab, sort=newest) —
+     *      the throttle-proof API tier that made v1.5 search fast;
+     *      ~30 newest videos with views/dates/durations.
+     *   2. YouTube RSS feed — 15 newest entries with EXACT publish
+     *      timestamps; pins the very newest items and supplies a
+     *      sortable epoch for every card.
+     *   3. Piped /channel/{id} → header (name/avatar/desc/subs) and
+     *      videos when the instance still returns them.
+     *   4. youtube.com scrape → header extras (banner/handle) + videos.
+     * Videos are deduped by id, given a `published` epoch (RSS exact,
+     * relative texts parsed otherwise), and sorted NEWEST-FIRST.
      * @handle requests resolve to a UC id through Piped's channel search
-     * first, then fall back to scraping /@handle/videos directly. */
+     * first, then by scraping the handle page for externalId. */
     if (path === '/__yt/channel') {
       const idParam = (url.searchParams.get('id') || '').trim();
       const handleParam = (url.searchParams.get('handle') || '').trim();
@@ -467,85 +496,132 @@ async function handleRequest(request) {
       if (hit) return json(hit);
 
       let resolvedId = idParam; /* may be filled in by handle resolution */
-      let pipedHeader = null;   /* header from Piped */
 
-      /* -- resolve @handle → UC id (Piped first, fast) ---------------- */
+      /* -- resolve @handle → UC id (Piped first, then externalId) --- */
       if (!resolvedId && handleParam) {
-        try { resolvedId = await pipedResolveHandle(handleParam); } catch (e) { /* scrape fallback below */ }
+        try { resolvedId = await pipedResolveHandle(handleParam); } catch (e) { /* next */ }
+        if (!resolvedId) {
+          try {
+            const html = await fetchUpstream(YT_HOME + '/' + (handleParam.startsWith('@') ? handleParam : '@' + handleParam) + '?hl=en', 6000);
+            const m = /"externalId":"(UC[A-Za-z0-9_-]{18,30})"/.exec(html || '');
+            if (m) resolvedId = m[1];
+          } catch (e) { /* scrape fallback below may still work */ }
+        }
       }
 
-      /* -- Piped header tier (also carries videos when the instance
-            still returns them inline) ---------------------------------- */
-      let pipedVideos = [];
+      /* -- run ALL tiers in parallel; failures return null ---------- */
+      const jobs = [];
       if (resolvedId) {
-        try {
-          const j = await pipedGet('/channel/' + encodeURIComponent(resolvedId), jj => jj && (jj.name || Array.isArray(jj.relatedStreams)));
-          const pc = pipedToChannel(j, resolvedId);
-          pipedHeader = pc.header;
-          pipedVideos = pc.videos || [];
-          /* newer Piped builds moved videos to a continuation token */
-          if (!pipedVideos.length && j && j.nextpage) {
-            try {
-              /* the token carries the full request — try each base
-                 until one accepts it (usually the issuing instance) */
-              for (const b of PIPED_BASES) {
-                try {
-                  const r = await fetchTimeout(b + '/nextpage/channel/' + encodeURIComponent(resolvedId) + '?nextpage=' + encodeURIComponent(j.nextpage), { headers: { Accept: 'application/json' } }, 5000);
-                  if (!r.ok) continue;
-                  const j2 = await r.json();
-                  const rs = (j2 && j2.relatedStreams) || [];
-                  if (rs.length) { pipedVideos = rs.map(pipedItemToVideo).filter(v => v && v.id).slice(0, 30); break; }
-                } catch (e2) { /* next base */ }
-              }
-            } catch (e) { /* pagination unavailable */ }
+        jobs.push(
+          innertubeBrowseChannel(resolvedId, 7000)
+            .then(r => ({ kind: 'browse', header: r.header, videos: r.videos }))
+            .catch(() => null)
+        );
+        jobs.push(
+          rssChannel(resolvedId, 5000)
+            .then(v => ({ kind: 'rss', videos: v }))
+            .catch(() => null)
+        );
+        jobs.push(
+          pipedGet('/channel/' + encodeURIComponent(resolvedId), jj => jj && (jj.name || Array.isArray(jj.relatedStreams)), 6000)
+            .then(j => {
+              const pc = pipedToChannel(j, resolvedId);
+              return { kind: 'piped', header: pc.header, videos: pc.videos };
+            })
+            .catch(() => null)
+        );
+      }
+      jobs.push(
+        (async () => {
+          const scrapeTarget = resolvedId
+            ? YT_HOME + '/channel/' + encodeURIComponent(resolvedId) + '/videos?hl=en'
+            : YT_HOME + '/' + (handleParam.startsWith('@') ? handleParam : '@' + handleParam) + '/videos?hl=en';
+          try {
+            const html = await fetchUpstream(scrapeTarget);
+            const parsed = parseChannel(html);
+            if (parsed && (parsed.header.title || (parsed.videos || []).length)) {
+              return { kind: 'scrape', header: parsed.header, videos: parsed.videos };
+            }
+          } catch (e) { /* tier down */ }
+          return null;
+        })()
+      );
+      /* grace window (v1.5's search lesson): a hanging scrape must not
+         stall an otherwise-instant browse+RSS answer — tiers that
+         haven't settled within the window are dropped from the merge */
+      const settled = (await settleWithin(jobs, 3400)).filter(Boolean);
+      const byKind = k => settled.find(x => x.kind === k);
+      const pipedS = byKind('piped');
+      const scrapeS = byKind('scrape');
+      const browseS = byKind('browse');
+      const rssS = byKind('rss');
+
+      /* -- merge headers: scrape extras + Piped freshness + browse gap
+            filler; first non-empty value per key wins by layer order -- */
+      const h = {};
+      if (browseS && browseS.header) Object.assign(h, browseS.header);
+      if (scrapeS && scrapeS.header) Object.assign(h, scrapeS.header);
+      if (pipedS && pipedS.header) Object.assign(h, pipedS.header);
+      /* restore scrape-only extras the layers above may have blanked */
+      if (scrapeS && scrapeS.header) {
+        for (const k of ['banner', 'handle', 'videosCount', 'desc', 'id']) {
+          if (scrapeS.header[k] && !h[k]) h[k] = scrapeS.header[k];
+        }
+        if (!h.subs && scrapeS.header.subs) h.subs = scrapeS.header.subs;
+      }
+      if (h.id) h.url = h.url || ('https://www.youtube.com/channel/' + h.id);
+      else if (resolvedId) { h.id = resolvedId; h.url = 'https://www.youtube.com/channel/' + resolvedId; }
+
+      /* -- merge videos: browse (rich) → scrape → piped fill the base
+            fields; RSS entries then ADD anything the others missed and
+            OVERRIDE `published` with the exact timestamp ------------- */
+      const merged = [];
+      const idx = new Map();
+      const pushAll = (list) => {
+        for (const v of (list || [])) {
+          if (!v || !v.id) continue;
+          let cur = idx.get(v.id);
+          if (!cur) { cur = {}; idx.set(v.id, cur); merged.push(cur); }
+          for (const k of Object.keys(v)) {
+            if (v[k] !== '' && v[k] != null && (cur[k] === '' || cur[k] == null)) cur[k] = v[k];
           }
-        } catch (e) { /* Piped tier down — scrape still covers us */ }
+        }
+      };
+      pushAll(browseS && browseS.videos);
+      pushAll(scrapeS && scrapeS.videos);
+      pushAll(pipedS && pipedS.videos);
+      pushAll(rssS && rssS.videos);
+      /* exact RSS timestamps beat the parsed-relative approximations */
+      if (rssS) {
+        for (const v of rssS.videos) {
+          const cur = idx.get(v.id);
+          if (cur && v.published) cur.published = v.published;
+        }
       }
 
-      /* -- scrape tier: videos (primary) + header (fallback) ---------- */
-      const scrapeTarget = resolvedId
-        ? YT_HOME + '/channel/' + encodeURIComponent(resolvedId) + '/videos?hl=en'
-        : YT_HOME + '/' + (handleParam.startsWith('@') ? handleParam : '@' + handleParam) + '/videos?hl=en';
-      let scraped = null;
-      try {
-        const html = await fetchUpstream(scrapeTarget);
-        const parsed = parseChannel(html);
-        if (parsed && (parsed.header.title || (parsed.videos || []).length)) scraped = parsed;
-      } catch (e) { /* scrape down — Piped result is the answer */ }
+      /* channel attribution + published epoch for every card */
+      for (const v of merged) {
+        if (!v.published) v.published = parseRelDate(v.date || '');
+        if (!v.channel) v.channel = h.title || '';
+        if (!v.channelId) v.channelId = h.id || '';
+        if (v.views == null) v.views = '';
+        if (v.date == null) v.date = '';
+        if (v.duration == null) v.duration = '';
+        if (v.title == null) v.title = '';
+      }
+      /* NEWEST-FIRST (stable sort — undated cards keep tier order) */
+      merged.sort((a, b) => (b.published || 0) - (a.published || 0));
 
-      /* -- merge: Piped header wins on freshness, scrape wins on videos,
-            each fills the other's gaps ---------------------------------- */
-      let out = null;
-      if (pipedHeader || scraped) {
-        const h = Object.assign({}, (scraped && scraped.header) || {}, pipedHeader || {});
-        /* scrape-only extras that Piped never provides (Object.assign
-           above overwrites them with '' — restore the real values) */
-        if (scraped && scraped.header) {
-          for (const k of ['banner', 'handle', 'videosCount', 'desc']) {
-            if (scraped.header[k] && !h[k]) h[k] = scraped.header[k];
-          }
-          if (!h.subs && scraped.header.subs) h.subs = scraped.header.subs;
-        }
-        const videos = ((scraped && scraped.videos) || []).length
-          ? (scraped && scraped.videos)
-          : pipedVideos;
-        /* channel attribution on every card (lockups carry none) */
-        for (const v of (videos || [])) {
-          if (!v.channel) v.channel = h.title || '';
-          if (!v.channelId) v.channelId = h.id || '';
-        }
-        out = {
-          source: pipedHeader ? 'piped+scrape' : 'scrape',
+      if (merged.length || h.title) {
+        const out = {
+          source: settled.map(x => x.kind).join('+'),
           header: h,
-          videos: (videos || []).slice(0, 30),
+          videos: merged.slice(0, 30),
         };
-      }
-
-      if (out && (out.header.title || (out.videos || []).length)) {
         cacheSet(cacheKey, out, 300000);
         return json(out);
       }
-      return json({ error: 'channel unavailable — both the Piped tier and the youtube.com scrape failed. Try again in a moment.' }, { status: 502 });
+      return json({ error: 'channel unavailable — all four tiers (browse / RSS / scrape / Piped) failed. Try again in a moment.' }, { status: 502 });
     }
 
     /* image proxy — transparent passthrough for thumbnails ---------- */
@@ -703,6 +779,38 @@ async function raceTiers(tiers, opts) {
       }
       if (pending === 0) { clearTimeout(early); clearTimeout(timer); finish(); }
     }));
+  });
+}
+
+/* v1.6 helper: settle MANY parallel tiers within a grace window and
+   return whatever landed (failed/pending tiers → null). Used by the
+   channel endpoint, which MERGES all tiers instead of picking one —
+   a hanging scrape must not stall an otherwise-instant browse+RSS
+   answer. Resolves early once every job has settled. */
+function settleWithin(jobs, ms) {
+  return new Promise(resolve => {
+    const results = new Array(jobs.length).fill(null);
+    let pending = jobs.length;
+    let closed = false;
+    const finish = () => {
+      if (closed) return;
+      closed = true;
+      resolve(results);
+    };
+    const timer = setTimeout(finish, ms || 3200);
+    jobs.forEach((p, i) => {
+      Promise.resolve(p).then(
+        v => {
+          if (closed) return;
+          results[i] = v;
+          if (--pending === 0) { clearTimeout(timer); finish(); }
+        },
+        () => {
+          if (closed) return;
+          if (--pending === 0) { clearTimeout(timer); finish(); }
+        }
+      );
+    });
   });
 }
 
@@ -1445,6 +1553,145 @@ async function oembedVideo(id) {
   };
 }
 
+/* ----- channel freshness helpers (v1.6) ---------------------------- */
+
+/* "3 hours ago" / "Streamed 2 days ago" / "Premiered 1 week ago" →
+ * approximate epoch ms (0 when unparseable). Powers the newest-first
+ * ordering of merged channel videos. */
+function parseRelDate(s) {
+  const m = /(\d+)\s*(second|minute|hour|day|week|month|year)s?\s+ago/i.exec(String(s || ''));
+  if (!m) return 0;
+  const n = parseInt(m[1], 10);
+  const unitMs = { second: 1e3, minute: 6e4, hour: 36e5, day: 864e5, week: 6048e5, month: 2592e6, year: 31536e6 }[m[2].toLowerCase()];
+  return unitMs ? (Date.now() - n * unitMs) : 0;
+}
+
+/* compactVideoRenderer (innertube browse) → app video shape. */
+function compactToVideo(c) {
+  if (!c || !c.videoId) return null;
+  let chId = '';
+  try {
+    const run = c.shortBylineText && c.shortBylineText.runs && c.shortBylineText.runs[0];
+    const be = run && run.navigationEndpoint && run.navigationEndpoint.browseEndpoint;
+    chId = (be && be.browseId) || '';
+  } catch (e) {}
+  const dateTxt = textOf(c.publishedTimeText) || '';
+  return {
+    id: c.videoId,
+    title: textOf(c.title) || '',
+    thumb: 'https://i.ytimg.com/vi/' + c.videoId + '/hqdefault.jpg',
+    channel: textOf(c.shortBylineText) || '',
+    channelId: chId,
+    duration: textOf(c.lengthText) || '',
+    views: textOf(c.viewCountText) || '',
+    date: dateTxt,
+    published: parseRelDate(dateTxt),
+  };
+}
+
+/* innertube ANDROID_VR /browse — the channel's VIDEOS tab, sorted
+ * newest-first by YouTube itself. API endpoint (not an HTML page), so
+ * it dodges the datacenter-IP 429 throttling that breaks scrapes; the
+ * SAME client/tier that made v1.5 search fast and reliable. Returns
+ * { header, videos } (~30 newest items). */
+async function innertubeBrowseChannel(chId, ms) {
+  const r = await fetchTimeout('https://www.youtube.com/youtubei/v1/browse?prettyPrint=false', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'User-Agent': VR_UA },
+    body: JSON.stringify({
+      context: VR_CONTEXT,
+      browseId: chId,
+      params: 'EgZ2aWRlb3PyBgQKAjoA', /* videos tab, "Latest" sort */
+    }),
+  }, ms || 7000);
+  if (!r.ok) throw new Error('browse http ' + r.status);
+  const j = await r.json();
+
+  /* header: c4TabbedHeaderRenderer carries id/title/avatar/subs */
+  const header = {};
+  try {
+    const c4 = j.header && j.header.c4TabbedHeaderRenderer;
+    if (c4) {
+      if (c4.channelId) header.id = c4.channelId;
+      if (c4.title) header.title = c4.title;
+      if (c4.avatar && c4.avatar.thumbnails) header.avatar = pickThumb(c4.avatar.thumbnails);
+      if (c4.subscriberCountText) header.subs = textOf(c4.subscriberCountText);
+    }
+    /* handle from any tab's canonicalBaseUrl ("/@Name") */
+    const s = JSON.stringify(j);
+    const hm = /"canonicalBaseUrl":"\/(@[^"]+)"/.exec(s);
+    if (hm) header.handle = hm[1];
+  } catch (e) { /* header is best-effort */ }
+
+  /* videos: walk the whole tree for compactVideoRenderer items */
+  const videos = [];
+  const seen = new Set();
+  const walk = (n) => {
+    if (!n || typeof n !== 'object' || videos.length >= 40) return;
+    if (Array.isArray(n)) { for (const x of n) walk(x); return; }
+    if (n.compactVideoRenderer) {
+      const v = compactToVideo(n.compactVideoRenderer);
+      if (v && v.id && !seen.has(v.id)) { seen.add(v.id); videos.push(v); }
+    }
+    for (const k of Object.keys(n)) walk(n[k]);
+  };
+  walk(j.contents);
+  if (!videos.length && !header.title) throw new Error('browse empty');
+  return { header, videos };
+}
+
+/* YouTube channel RSS feed — the 15 ABSOLUTE LATEST uploads with EXACT
+ * publish timestamps (this is the feed RSS readers consume; it is NOT
+ * throttled and answers in ~200ms). Gives channel merges a source of
+ * truth for "what did this channel actually post most recently". */
+async function rssChannel(chId, ms) {
+  const r = await fetchTimeout(
+    'https://www.youtube.com/feeds/videos.xml?channel_id=' + encodeURIComponent(chId),
+    { headers: { 'User-Agent': UPSTREAM_HEADERS['User-Agent'], Accept: 'application/rss+xml, application/xml, text/xml, */*' } },
+    ms || 5000);
+  if (!r.ok) throw new Error('rss http ' + r.status);
+  const xml = await r.text();
+  const videos = [];
+  const re = /<entry>([\s\S]*?)<\/entry>/g;
+  let m;
+  while ((m = re.exec(xml)) && videos.length < 15) {
+    const e = m[1];
+    const pick = (tag) => {
+      const mm = new RegExp('<' + tag + '>([\s\S]*?)</' + tag + '>').exec(e);
+      return mm ? mm[1].trim() : '';
+    };
+    const idM = /<yt:videoId>([^<]+)<\/yt:videoId>/.exec(e);
+    if (!idM) continue;
+    const id = idM[1];
+    const when = Date.parse(pick('published')) || 0;
+    const viewsM = /<media:statistics views="(\d+)"/.exec(e);
+    const nameM = /<author>[\s\S]*?<name>([^<]*)<\/name>/.exec(e);
+    /* display date: relative while very fresh, absolute afterwards —
+       matches the look of the other tiers */
+    let dateTxt = '';
+    if (when) {
+      const ageH = (Date.now() - when) / 36e5;
+      if (ageH < 1) dateTxt = Math.max(1, Math.round(ageH * 60)) + ' minutes ago';
+      else if (ageH < 48) dateTxt = Math.round(ageH) + ' hours ago';
+      else if (ageH < 336) dateTxt = Math.round(ageH / 24) + ' days ago';
+      else dateTxt = new Date(when).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    }
+    videos.push({
+      id,
+      title: pick('title'),
+      thumb: 'https://i.ytimg.com/vi/' + id + '/hqdefault.jpg',
+      channel: nameM ? nameM[1] : '',
+      channelId: chId,
+      duration: '',
+      views: viewsM ? parseInt(viewsM[1], 10).toLocaleString('en-US') + ' views' : '',
+      date: dateTxt,
+      published: when,
+    });
+  }
+  if (!videos.length) throw new Error('rss empty');
+  return videos;
+}
+
 /* ----- tiny in-memory TTL cache (per isolate) ---------------------- *
  * Softens repeated hammering of the same video/channel within a few
  * minutes (back navigation, subs refresh). Cheap Map + size cap. */
@@ -1616,7 +1863,8 @@ function pipedToVideo(pd, id) {
 }
 
 /* Map a Piped feed item (search result / related stream / trending)
-   onto the app's video-card shape. */
+   onto the app's video-card shape. v1.6: carries `published` (epoch ms)
+   so channel merges can sort newest-first. */
 function pipedItemToVideo(x) {
   const id = videoIdFromPipedUrl(x.url);
   const chId = chIdFromPipedUrl(x.uploaderUrl);
@@ -1631,6 +1879,7 @@ function pipedItemToVideo(x) {
     duration: fmtDuration(x.duration),
     views: typeof x.views === 'number' ? x.views.toLocaleString('en-US') + ' views' : (x.views > 0 ? x.views + ' views' : ''),
     date: x.uploadedDate || (typeof x.uploaded === 'number' ? new Date(x.uploaded).toLocaleDateString('en-US') : ''),
+    published: typeof x.uploaded === 'number' ? x.uploaded : parseRelDate(x.uploadedDate || ''),
   };
 }
 
