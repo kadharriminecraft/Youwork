@@ -1,5 +1,5 @@
 /* =====================================================================
-   YT-ONLY WORKER v1.1 — a dedicated Cloudflare Worker purpose-built for
+   YT-ONLY WORKER v1.2 — a dedicated Cloudflare Worker purpose-built for
    the YT-Only app (the stripped-down YouTube-only player).
 
    Deploy on YOUR Cloudflare account (free tier is fine):
@@ -9,13 +9,32 @@
      4. In the app: Settings (gear) → paste the URL → Save → Test connection
 
    What this worker does:
-     - /__yt/health           → version probe ("yt-only-ok/1.1")
+     - /__yt/health           → version probe ("yt-only-ok/1.2")
      - /__yt/search?q=QUERY   → JSON { videos:[{id,title,channel,thumb,duration,...}] }
      - /__yt/video?id=VID     → JSON { id,title,description,views,date,channel,related }
      - /__yt/home             → JSON { videos:[...] } (popular feed)
      - /__yt/channel?id=|handle= → JSON { header, videos:[...] }
+     - /__yt/dl?id=VID&type=audio|video → streams the file through this
+       worker (Content-Disposition: attachment) so the browser downloads
+       it directly from YOUR worker — no external site needed.
      - /__yt/img?url=URL      → passthrough image proxy
      - /__yt/proxy?url=URL    → generic CORS proxy
+
+   WHAT CHANGED IN v1.2 (fixes 429 throttling + adds downloads):
+     1. YouTube 429-throttles /watch page scrapes from some datacenter
+        IPs ("upstream 429" — that's why video details sometimes broke).
+        /__yt/video now has a 3-source fallback chain:
+          a) youtube.com/watch HTML scrape (best data)
+          b) Piped API instances (pipedapi…) — metadata + related
+          c) YouTube innertube player API (ANDROID_VR client) — metadata
+             + stream URLs; related via the /next endpoint.
+        Whichever source answers first wins, so video details now work
+        even when YouTube throttles one path.
+     2. NEW /__yt/dl endpoint — download the video (MP4 with sound) or
+        just the audio (M4A) as a stream piped through this worker.
+        Sources: innertube ANDROID_VR direct googlevideo URLs first,
+        Piped instance streams as fallback. Range requests supported.
+     3. /__yt/search and /__yt/home also gained Piped fallbacks.
 
    WHAT CHANGED IN v1.1 (fixes channel + video details):
      1. SOCS/CONSENT cookies. YouTube answers datacenter IPs with the
@@ -48,7 +67,7 @@
    ===================================================================== */
 
 /* ----- version + config -------------------------------------------- */
-const VERSION = '1.1';
+const VERSION = '1.2';
 const HEALTH_TAG = 'yt-only-ok/' + VERSION;
 const YT_HOME = 'https://www.youtube.com';
 
@@ -57,6 +76,40 @@ const YT_HOME = 'https://www.youtube.com';
    pages still ship full ytInitialData with 100 video lockups.
    This is YouTube's official "Most Popular" playlist. */
 const HOME_PLAYLIST = 'PLFgquLnL59alCl_2TQvOiD5Vgm1hCaGSI';
+
+/* Piped API instances, tried in order (video metadata fallback chain
+   + download fallback). Public community instances; availability
+   varies, so the worker walks the list until one answers. */
+const PIPED_INSTANCES = [
+  'https://api.piped.private.coffee',
+  'https://pipedapi.kavin.rocks',
+  'https://pipedapi.adminforge.de',
+  'https://pipedapi.drgns.space',
+  'https://piapi.ggtyler.dev',
+  'https://pipedapi.ducks.party',
+];
+
+/* innertube ANDROID_VR client — currently the most reliable client
+   that returns deciphered (direct) stream URLs without PO tokens. */
+const VR_UA = 'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12; eureka-user Build/SQ3A.220705.004.A1) gzip';
+const VR_CONTEXT = {
+  client: {
+    clientName: 'ANDROID_VR',
+    clientVersion: '1.60.19',
+    deviceMake: 'Oculus',
+    deviceModel: 'Quest 3',
+    osName: 'Android',
+    osVersion: '12',
+    androidSdkVersion: 32,
+  },
+};
+
+/* fetch with timeout — Workers give us setTimeout, so we race it. */
+function fetchTimeout(url, opts, ms) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms || 12000);
+  return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(t));
+}
 
 /* Default request headers sent UP to youtube.com — DESKTOP UA is
    required: mobile UA gets redirected to m.youtube.com which serves a
@@ -116,25 +169,59 @@ async function handleRequest(request) {
     if (path === '/__yt/search') {
       const q = (url.searchParams.get('q') || '').trim();
       if (!q) return json({ error: 'missing q', videos: [] });
-      const html = await fetchUpstream(YT_HOME + '/results?search_query=' + encodeURIComponent(q) + '&hl=en&gl=US');
-      const videos = collectVideos(extractYtInitialData(html));
-      return json({ query: q, videos });
+      try {
+        const html = await fetchUpstream(YT_HOME + '/results?search_query=' + encodeURIComponent(q) + '&hl=en&gl=US');
+        const videos = collectVideos(extractYtInitialData(html));
+        if (videos.length) return json({ query: q, videos });
+      } catch (e) { /* fall through to Piped */ }
+      const pv = await pipedSearch(q);
+      return json({ query: q, videos: pv });
     }
 
-    /* video metadata — full /watch page parse ---------------------- */
+    /* video metadata — full /watch page parse, with fallback chain -- */
     if (path === '/__yt/video') {
       const id = (url.searchParams.get('id') || '').trim();
       if (!id) return json({ error: 'missing id' });
-      const html = await fetchUpstream(YT_HOME + '/watch?v=' + encodeURIComponent(id) + '&hl=en');
-      const data = parseWatchPage(html, id);
-      return json(data);
+      let data = null, lastErr = null;
+      /* 1) HTML scrape (richest data: banner, exact dates, subs) */
+      try {
+        const html = await fetchUpstream(YT_HOME + '/watch?v=' + encodeURIComponent(id) + '&hl=en');
+        data = parseWatchPage(html, id);
+      } catch (e) { lastErr = e; }
+      /* 2) Piped API — works even when YouTube throttles our IP */
+      if (!data || !data.title) {
+        try {
+          const pd = await pipedStreams(id);
+          if (pd && pd.title) data = pipedToVideo(pd, id);
+        } catch (e) { /* keep going */ }
+      }
+      /* 3) innertube ANDROID_VR player (metadata) + /next (related) */
+      if (!data || !data.title) {
+        try {
+          const iv = await innertubePlayer(id);
+          if (iv && iv.videoDetails && iv.videoDetails.title) {
+            data = await innertubeToVideo(iv, id);
+          }
+        } catch (e) { /* keep going */ }
+      }
+      if (data && (data.title || data.id)) return json(data);
+      return json({ error: 'video unavailable: ' + (lastErr ? lastErr.message : 'no source answered') }, { status: 502 });
+    }
+
+    /* download — stream video (MP4 with audio) or audio (M4A) ------- */
+    if (path === '/__yt/dl') {
+      return await handleDownload(url, request);
     }
 
     /* home feed (popular playlist) ---------------------------------- */
     if (path === '/__yt/home') {
-      const html = await fetchUpstream(YT_HOME + '/playlist?list=' + HOME_PLAYLIST + '&hl=en');
-      const videos = collectVideos(extractYtInitialData(html), null, 40);
-      return json({ videos });
+      try {
+        const html = await fetchUpstream(YT_HOME + '/playlist?list=' + HOME_PLAYLIST + '&hl=en');
+        const videos = collectVideos(extractYtInitialData(html), null, 40);
+        if (videos.length) return json({ videos });
+      } catch (e) { /* fall through to Piped trending */ }
+      const tv = await pipedTrending();
+      return json({ videos: tv.slice(0, 40) });
     }
 
     /* channel page -------------------------------------------------- */
@@ -691,4 +778,301 @@ function applyVideoDetails(result, vd) {
   if (vd.thumbnail && vd.thumbnail.thumbnails && vd.thumbnail.thumbnails.length) {
     result.thumb = vd.thumbnail.thumbnails[vd.thumbnail.thumbnails.length - 1].url;
   }
+}
+
+/* =====================================================================
+   v1.2 — FALLBACK SOURCES (Piped + innertube) + DOWNLOADS
+   =====================================================================
+   YouTube 429-throttles /watch scrapes from many datacenter IPs. When
+   that happens we get our data from elsewhere instead of failing:
+
+     - Piped API instances: metadata, related videos, search, trending,
+       and (on some instances) downloadable stream URLs.
+     - YouTube innertube API, ANDROID_VR client: videoDetails +
+       DECIPHERED direct googlevideo stream URLs (works without PO
+       tokens). Also /next for related videos.
+
+   Everything below maps those sources onto the SAME response shapes
+   the app already consumes, so the frontend needs no changes. */
+
+/* Piped: GET /streams/{id} from the first instance that answers. */
+async function pipedStreams(videoId) {
+  for (const base of PIPED_INSTANCES) {
+    try {
+      const r = await fetchTimeout(base + '/streams/' + encodeURIComponent(videoId), { headers: { Accept: 'application/json' } }, 10000);
+      if (!r.ok) continue;
+      const j = await r.json();
+      if (j && (j.title || j.relatedStreams)) return j;
+    } catch (e) { /* try next instance */ }
+  }
+  return null;
+}
+
+/* Piped: GET /search?q=...&filter=videos */
+async function pipedSearch(q) {
+  for (const base of PIPED_INSTANCES) {
+    try {
+      const r = await fetchTimeout(base + '/search?q=' + encodeURIComponent(q) + '&filter=videos', { headers: { Accept: 'application/json' } }, 10000);
+      if (!r.ok) continue;
+      const j = await r.json();
+      if (j && Array.isArray(j.items) && j.items.length) {
+        return j.items.filter(x => x && (x.url || '').includes('watch?v=')).map(pipedItemToVideo).slice(0, 40);
+      }
+    } catch (e) { /* try next instance */ }
+  }
+  return [];
+}
+
+/* Piped: GET /trending?region=US */
+async function pipedTrending() {
+  for (const base of PIPED_INSTANCES) {
+    try {
+      const r = await fetchTimeout(base + '/trending?region=US', { headers: { Accept: 'application/json' } }, 10000);
+      if (!r.ok) continue;
+      const j = await r.json();
+      if (Array.isArray(j) && j.length) {
+        return j.filter(x => x && (x.url || '').includes('watch?v=')).map(pipedItemToVideo);
+      }
+    } catch (e) { /* try next instance */ }
+  }
+  return [];
+}
+
+/* innertube: ANDROID_VR player call. Returns the raw player response
+   (videoDetails + streamingData with direct URLs). */
+async function innertubePlayer(videoId) {
+  const r = await fetchTimeout('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'User-Agent': VR_UA },
+    body: JSON.stringify({ context: VR_CONTEXT, videoId, contentCheckOk: true, racyCheckOk: true }),
+  }, 12000);
+  if (!r.ok) return null;
+  return r.json().catch(() => null);
+}
+
+/* innertube: /next (related videos) with the same VR client. */
+async function innertubeNext(videoId) {
+  try {
+    const r = await fetchTimeout('https://www.youtube.com/youtubei/v1/next?prettyPrint=false', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': VR_UA },
+      body: JSON.stringify({ context: VR_CONTEXT, videoId }),
+    }, 12000);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) { return null; }
+}
+
+/* Map a Piped /streams response onto the app's watch-page shape. */
+function pipedToVideo(pd, id) {
+  const chId = chIdFromPipedUrl(pd.uploaderUrl);
+  const related = (pd.relatedStreams || [])
+    .filter(x => x && (x.url || '').includes('watch?v='))
+    .map(pipedItemToVideo)
+    .slice(0, 24);
+  return {
+    id,
+    title: pd.title || '',
+    description: pd.description || '',
+    views: typeof pd.views === 'number' ? pd.views.toLocaleString('en-US') + ' views' : '',
+    date: pd.uploadDate || pd.uploadedDate || '',
+    duration: fmtDuration(pd.duration),
+    thumb: 'https://i.ytimg.com/vi/' + id + '/hqdefault.jpg',
+    channel: {
+      id: chId,
+      name: pd.uploader || '',
+      avatar: pd.uploaderAvatar || '',
+      subs: fmtSubs(pd.uploaderSubscriberCount),
+      url: chId ? 'https://www.youtube.com/channel/' + chId : '',
+    },
+    related,
+  };
+}
+
+/* Map a Piped feed item (search result / related stream / trending)
+   onto the app's video-card shape. */
+function pipedItemToVideo(x) {
+  const id = videoIdFromPipedUrl(x.url);
+  const chId = chIdFromPipedUrl(x.uploaderUrl);
+  return {
+    id,
+    title: x.title || '',
+    thumb: x.thumbnail && /^https?:/.test(x.thumbnail)
+      ? 'https://i.ytimg.com/vi/' + id + '/hqdefault.jpg'
+      : 'https://i.ytimg.com/vi/' + id + '/hqdefault.jpg',
+    channel: x.uploader || '',
+    channelId: chId,
+    duration: fmtDuration(x.duration),
+    views: typeof x.views === 'number' ? x.views.toLocaleString('en-US') + ' views' : (x.views > 0 ? x.views + ' views' : ''),
+    date: x.uploadedDate || (typeof x.uploaded === 'number' ? new Date(x.uploaded).toLocaleDateString('en-US') : ''),
+  };
+}
+
+/* Map innertube videoDetails + /next related onto the watch shape. */
+async function innertubeToVideo(iv, id) {
+  const vd = iv.videoDetails || {};
+  const chId = vd.channelId || '';
+  let related = [];
+  const nx = await innertubeNext(id);
+  if (nx) related = collectVideos(nx, id, 24);
+  return {
+    id,
+    title: vd.title || '',
+    description: vd.shortDescription || '',
+    views: vd.viewCount ? parseInt(vd.viewCount, 10).toLocaleString('en-US') + ' views' : '',
+    date: (iv && iv.microformat && iv.microformat.playerMicroformatRenderer &&
+      (iv.microformat.playerMicroformatRenderer.publishDate || iv.microformat.playerMicroformatRenderer.uploadDate)) || '',
+    duration: fmtDuration(parseInt(vd.lengthSeconds || '0', 10)),
+    thumb: 'https://i.ytimg.com/vi/' + id + '/hqdefault.jpg',
+    channel: {
+      id: chId,
+      name: vd.author || '',
+      avatar: '',
+      subs: '',
+      url: chId ? 'https://www.youtube.com/channel/' + chId : '',
+    },
+    related,
+  };
+}
+
+/* ----- /__yt/dl — download handler -------------------------------- *
+ * Streams the media THROUGH this worker so the user's browser only
+ * ever talks to the worker domain (the direct URLs are unreachable
+ * for many users). Range requests are passed through so resumable
+ * downloads and media seeking keep working. */
+async function handleDownload(url, request) {
+  const id = (url.searchParams.get('id') || '').trim();
+  const type = (url.searchParams.get('type') || 'video').trim().toLowerCase();
+  const titleParam = url.searchParams.get('title') || '';
+  if (!id) return json({ error: 'missing id' }, { status: 400 });
+  if (type !== 'audio' && type !== 'video') return json({ error: 'type must be audio or video' }, { status: 400 });
+
+  let stream = null; /* { url, mime, title } */
+  let why = '';
+
+  /* 1) innertube ANDROID_VR — direct googlevideo URLs (deciphered). */
+  try {
+    const iv = await innertubePlayer(id);
+    if (iv && iv.streamingData) {
+      const title = (iv.videoDetails && iv.videoDetails.title) || titleParam || 'video';
+      const formats = [
+        ...((iv.streamingData.formats || [])),
+        ...((iv.streamingData.adaptiveFormats || [])),
+      ].filter(f => f && f.url);
+      if (type === 'audio') {
+        const audio = formats
+          .filter(f => (f.mimeType || '').startsWith('audio'))
+          .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+        const m4a = audio.find(f => (f.mimeType || '').includes('audio/mp4'));
+        const pick = m4a || audio[0];
+        if (pick) stream = { url: pick.url, mime: 'audio/mp4', title };
+        else why = 'innertube returned no audio formats';
+      } else {
+        /* progressive = audio+video muxed. adaptiveFormats are
+           video-only (can't be downloaded alone as a watchable file). */
+        const prog = (iv.streamingData.formats || [])
+          .filter(f => f.url && (f.mimeType || '').startsWith('video/') && (f.mimeType || '').includes('mp4'))
+          .sort((a, b) => (b.width || 0) - (a.width || 0));
+        const pick = prog[0];
+        if (pick) stream = { url: pick.url, mime: 'video/mp4', title };
+        else why = 'innertube returned no progressive MP4';
+      }
+    } else {
+      why = 'innertube player unavailable (age/music-restricted or throttled)';
+    }
+  } catch (e) { why = 'innertube error: ' + (e && e.message); }
+
+  /* 2) Piped instance streams (their proxy URLs work cross-IP). */
+  if (!stream) {
+    try {
+      const pd = await pipedStreams(id);
+      if (pd) {
+        const title = pd.title || titleParam || 'video';
+        if (type === 'audio') {
+          const audio = (pd.audioStreams || []).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+          if (audio.length) {
+            const a = audio.find(x => (x.mimeType || '').includes('audio/mp4')) || audio[0];
+            stream = { url: a.url, mime: (a.mimeType || 'audio/mp4').split(';')[0], title };
+          }
+        } else {
+          const prog = (pd.videoStreams || []).filter(v => v.videoOnly === false && (v.mimeType || '').includes('mp4'));
+          if (prog.length) {
+            const v = prog.sort((a, b) => (b.quality || 0) - (a.quality || 0))[0];
+            stream = { url: v.url, mime: 'video/mp4', title };
+          }
+        }
+      }
+    } catch (e) { /* fall through */ }
+  }
+
+  if (!stream) {
+    return json({
+      error: type === 'audio'
+        ? 'No audio-only stream available for this video (YouTube requires sign-in for it). Try the Video download — it includes sound.'
+        : 'No downloadable video stream found for this video. ' + why,
+    }, { status: 502 });
+  }
+
+  /* filename: sanitized title + extension from mime */
+  const ext = (stream.mime || '').includes('audio') ? '.m4a' : '.mp4';
+  const filename = sanitizeFilename(stream.title || titleParam || 'download') + ext;
+
+  /* fetch upstream, passing the browser's Range header through */
+  const upHeaders = {};
+  const range = request && request.headers.get('Range');
+  if (range) upHeaders['Range'] = range;
+  const r = await fetch(stream.url, { headers: upHeaders });
+  if (!r.ok && r.status !== 206) {
+    return json({ error: 'stream fetch failed (' + r.status + ') — try again' }, { status: 502 });
+  }
+
+  const out = new Headers({
+    'Content-Type': stream.mime || 'application/octet-stream',
+    'Content-Disposition': 'attachment; filename="' + filename + '"',
+    'Cache-Control': 'no-store',
+  });
+  for (const h of ['Content-Length', 'Content-Range', 'Accept-Ranges']) {
+    const v = r.headers.get(h);
+    if (v) out.set(h, v);
+  }
+  for (const [k, v] of Object.entries(CORS)) out.set(k, v);
+  /* let the app read these cross-origin (download progress / filename) */
+  out.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Content-Disposition, Accept-Ranges');
+
+  /* stream the body straight through the worker */
+  return new Response(r.body, { status: r.status, headers: out });
+}
+
+/* ----- small format helpers --------------------------------------- */
+function videoIdFromPipedUrl(u) {
+  if (!u) return '';
+  const m = /[?&]v=([\w-]{6,})/.exec(u) || /^\/?watch\?v=([\w-]{6,})/.exec(u);
+  return m ? m[1] : '';
+}
+function chIdFromPipedUrl(u) {
+  if (!u) return '';
+  const m = /^\/?(?:channel\/)?(UC[\w-]{20,})/.exec(u);
+  return m ? m[1] : '';
+}
+function fmtDuration(sec) {
+  sec = parseInt(sec, 10);
+  if (!sec || sec < 0) return '';
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return h ? h + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0')
+       : m + ':' + String(s).padStart(2, '0');
+}
+function fmtSubs(n) {
+  if (typeof n !== 'number' || n <= 0) return '';
+  if (n >= 1e9) return (n / 1e9).toFixed(1).replace(/\.0$/, '') + 'B subscribers';
+  if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M subscribers';
+  if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, '') + 'K subscribers';
+  return n + ' subscribers';
+}
+function sanitizeFilename(name) {
+  return String(name)
+    .replace(/[\r\n\/\\]+/g, ' ')
+    .replace(/[^\w\s.\-()&'\[\]]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80) || 'download';
 }
