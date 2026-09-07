@@ -1,5 +1,5 @@
 /* =====================================================================
-   YT-ONLY WORKER v1.3 — a dedicated Cloudflare Worker purpose-built for
+   YT-ONLY WORKER v1.4 — a dedicated Cloudflare Worker purpose-built for
    the YT-Only app (the stripped-down YouTube-only player).
 
    Deploy on YOUR Cloudflare account (free tier is fine):
@@ -9,7 +9,7 @@
      4. In the app: Settings (gear) → paste the URL → Save → Test connection
 
    What this worker does:
-     - /__yt/health           → version probe ("yt-only-ok/1.3")
+     - /__yt/health           → version probe ("yt-only-ok/1.4")
      - /__yt/search?q=QUERY   → JSON { videos:[...], channels:[...] }
      - /__yt/video?id=VID     → JSON { id,title,description,views,date,channel,related }
      - /__yt/home             → JSON { videos:[...] } (popular feed)
@@ -19,6 +19,33 @@
        it directly from YOUR worker — no external site needed.
      - /__yt/img?url=URL      → passthrough image proxy
      - /__yt/proxy?url=URL    → generic CORS proxy
+
+   v1.4 ALSO PROXIES THE EZCONV CONVERTER WEBSITE (same idea as the
+   "Relay" proxy browser's super worker, specialized for one site):
+     - /__ez/<path>           → https://ezconv.cc/<path>
+       The real ezconv.cc page — HTML rewritten so every asset, link and
+       SPA route stays inside the proxy. Opens even when ezconv.cc is
+       blocked on your network, because it loads from YOUR worker.
+     - /__ezapi/<path>        → https://api.ezsrv.net/<path>
+       The converter API (attest / convert / status) — proxied and
+       CORS-unlocked. The page's own JS is rewritten to call this.
+     - /__ezdl/<host>/<path>  → https://<host>/<path> (dl*.ezsrv.net only)
+       Download relay for converted files: streams the MP3/MP4 through
+       the worker with the original filename + Range support.
+     - anything else at root  → 302 into /__ez — so the Next.js SPA's
+       own runtime fetches (un-prefixed /_next/…, RSC routes) always
+       land back inside the proxy. The worker root IS the converter:
+       just open https://YOUR.WORKER/ and ezconv appears, unblocked.
+
+   WHAT CHANGED IN v1.4 (ezconv integration):
+     1. EZCONV SITE PROXY — the app's Download button now opens the real
+        ezconv.cc converter THROUGH this worker (Relay-style): HTML/JS
+        rewriting (assets, links, API base, download hosts), RSC/Next.js
+        router passthrough, forced-download relay for converted files.
+     2. The video link is copied to the clipboard on the way out AND
+        auto-pasted into the converter's input (?url=… prefill script).
+     3. All v1.3 YouTube endpoints unchanged — search / video / home /
+        channel / dl keep the Piped + innertube fallback chains.
 
    WHAT CHANGED IN v1.3 (channel reliability + fast reliable downloads):
      1. CHANNELS — ported from the Relay browser app, whose channel code
@@ -87,7 +114,7 @@
    ===================================================================== */
 
 /* ----- version + config -------------------------------------------- */
-const VERSION = '1.3';
+const VERSION = '1.4';
 const HEALTH_TAG = 'yt-only-ok/' + VERSION;
 const YT_HOME = 'https://www.youtube.com';
 
@@ -182,6 +209,28 @@ const UPSTREAM_HEADERS = {
   'Cookie': 'SOCS=CAI; CONSENT=YES+cb.20210328-17-p0.en+FX+419',
 };
 
+/* ----- ezconv.cc proxy config (v1.4) -------------------------------- *
+ * The converter the app's Download button opens. Three upstreams:
+ *   EZ_SITE  — the Next.js website (pages, assets, RSC routes)
+ *   EZ_API   — the conversion API (attest/convert/status/notice)
+ *   EZ_DL_RE — download CDNs (dl1/dl2/… .ezsrv.net) for converted files
+ * The page's JS chunks are rewritten so every fetch it makes lands on
+ * this worker; JSON responses have their downloadUrl rewritten the
+ * same way. Everything else (fonts, turnstile) stays direct. */
+const EZ_SITE = 'https://ezconv.cc';
+const EZ_API = 'https://api.ezsrv.net';
+const EZ_DL_HOST_RE = /^[a-z0-9.-]*\.ezsrv\.net$/i;
+const EZ_PREFIX = '/__ez';
+const EZ_API_PREFIX = '/__ezapi';
+const EZ_DL_PREFIX = '/__ezdl';
+/* headers forwarded between the browser and the two ezconv upstreams —
+ * includes the full Next.js RSC set so client-side navigation works */
+const EZ_FORWARD_REQ = new Set([
+  'accept', 'accept-language', 'range', 'if-none-match', 'if-modified-since',
+  'content-type', 'rsc', 'next-router-state-tree', 'next-router-prefetch',
+  'next-router-segment-prefetch', 'next-url', 'next-action', 'next-test-data',
+]);
+
 /* ----- CORS -------------------------------------------------------- */
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -204,8 +253,11 @@ function text(s, init) {
 }
 
 /* ----- main entry -------------------------------------------------- */
+let EZ_CTX = null; /* execution context (waitUntil) for cache writes */
+
 export default {
-  async fetch(request) {
+  async fetch(request, env, ctx) {
+    EZ_CTX = ctx || null;
     return handleRequest(request);
   },
 };
@@ -451,6 +503,53 @@ async function handleRequest(request) {
           'Content-Type': ct,
           'Cache-Control': 'public, max-age=300',
           ...CORS,
+        },
+      });
+    }
+
+    /* =============================================================== *
+     * ezconv.cc converter proxy (v1.4) — Relay-style, single-site.
+     * See the ezProxy section near the bottom for the rewriting logic.
+     * =============================================================== */
+    /* API tier: /__ezapi/<path> → https://api.ezsrv.net/<path> */
+    if (path === EZ_API_PREFIX || path.startsWith(EZ_API_PREFIX + '/')) {
+      return await ezApiProxy(url, request);
+    }
+    /* download tier: /__ezdl/<host>/<path> → https://<host>/<path> */
+    if (path === EZ_DL_PREFIX || path.startsWith(EZ_DL_PREFIX + '/')) {
+      return await ezDlProxy(url, request);
+    }
+    /* site tier: /__ez/<path> → https://ezconv.cc/<path> */
+    if (path === EZ_PREFIX || path.startsWith(EZ_PREFIX + '/')) {
+      return await ezSiteProxy(url, request);
+    }
+
+    /* root catch-all → the converter (v1.4).
+     * The worker has no content outside /__yt and /__ez*, so ANY other
+     * GET (or HEAD) is a Next.js runtime fetch that lost its /__ez
+     * prefix — an un-rewritten <a href>, an RSC route the router built
+     * from the flight payload, a webpack chunk load at /_next/….
+     * 302 it back inside the proxy so the SPA never falls out.
+     * Non-GET (server actions POSTs) keep their method via 307. */
+    if (path !== '/' && !path.startsWith('/__yt') && !path.startsWith('/__ez')) {
+      const dest = EZ_PREFIX + path + (url.search || '');
+      return new Response(null, {
+        status: (request.method === 'GET' || request.method === 'HEAD') ? 302 : 307,
+        headers: {
+          'Location': dest,
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'no-store',
+        },
+      });
+    }
+    /* bare "/" → the converter home (ezconv.cc/ 307s to /en/k7x2) */
+    if (path === '/') {
+      return new Response(null, {
+        status: 302,
+        headers: {
+          'Location': EZ_PREFIX + '/en/k7x2',
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'no-store',
         },
       });
     }
@@ -1505,4 +1604,327 @@ function sanitizeFilename(name) {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 80) || 'download';
+}
+
+/* =================================================================== *
+ * EZCONV PROXY (v1.4) — the Relay-style single-site proxy browser.
+ * The app's Download button opens /__ez/en/k7x2?url=<video link> on
+ * this worker; the real ezconv.cc boots, entirely through the worker:
+ *
+ *   /__ez/<path>      → EZ_SITE pages/assets  (HTML + JS rewritten)
+ *   /__ezapi/<path>   → EZ_API                (attest/convert/status)
+ *   /__ezdl/<h>/<p>   → dl*.ezsrv.net         (converted file download)
+ *   /<anything else>  → 302 → /__ez/…         (SPA safety net, above)
+ *
+ * Rewriting rules, in order:
+ *   HTML  — src="/x" / href="/x"  → prefixed with /__ez
+ *           https://ezconv.cc/x   → /__ez/x
+ *           + a ?url= prefill script (pastes the video link into the
+ *             converter input for the user)
+ *   JS    — "https://api.ezsrv.net"     → <origin>/__ezapi
+ *           "https://ezconv.cc"         → <origin>/__ez
+ *           (turnstile + fonts + oembed stay direct — they must)
+ *   JSON  — "https://dl2.ezsrv.net/…"   → <origin>/__ezdl/dl2.ezsrv.net/…
+ *           so the Download button on the page hits the worker, which
+ *           relays the bytes as a real attachment.
+ * =================================================================== */
+
+/* build the upstream request for an ezconv upstream, forwarding the
+ * Next.js RSC headers + body so SPA navigation and POSTs survive */
+function ezUpstreamInit(url, request, origin, referer) {
+  const headers = new Headers();
+  for (const name of EZ_FORWARD_REQ) {
+    const v = request.headers.get(name);
+    if (v) headers.set(name, v);
+  }
+  headers.set('User-Agent', request.headers.get('user-agent') ||
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+  headers.set('Origin', origin);
+  if (referer) headers.set('Referer', referer);
+  if (!headers.get('Accept')) headers.set('Accept', '*/*');
+  if (!headers.get('Accept-Language')) headers.set('Accept-Language', 'en-US,en;q=0.9');
+  const init = {
+    method: (request.method === 'OPTIONS') ? 'GET' : request.method,
+    headers,
+    redirect: 'manual',
+    credentials: 'omit',
+  };
+  if (request.method !== 'GET' && request.method !== 'HEAD' && request.method !== 'OPTIONS') {
+    init.body = request.body;
+    init.duplex = 'half';
+  }
+  return init;
+}
+
+/* rebuild a proxied response: strip frame-blocking / cache-busting
+ * headers, add permissive CORS, keep the content intact */
+function ezRebuild(res, extra) {
+  const out = new Headers();
+  const STRIP = new Set([
+    'content-security-policy', 'content-security-policy-report-only',
+    'x-frame-options', 'strict-transport-security', 'report-to', 'nel',
+    'set-cookie', 'set-cookie2', 'alt-svc', 'cross-origin-opener-policy',
+    'cross-origin-embedder-policy', 'cross-origin-resource-policy',
+    'content-encoding', 'content-length', 'transfer-encoding',
+    'permissions-policy', 'feature-policy', 'x-content-type-options',
+    'cf-ray', 'cf-cache-status', 'server', 'reporting-endpoints',
+  ]);
+  res.headers.forEach((v, k) => { if (!STRIP.has(k.toLowerCase())) out.set(k, v); });
+  out.set('Access-Control-Allow-Origin', '*');
+  out.set('Access-Control-Allow-Methods', 'GET, HEAD, POST, OPTIONS');
+  out.set('Access-Control-Allow-Headers', '*');
+  if (extra) for (const k in extra) out.set(k, extra[k]);
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers: out });
+}
+
+/* ---- the prefill script injected into served HTML ---------------- *
+ * The app opens /__ez/en/k7x2?url=<youtube link>. This script waits
+ * for the converter's <input> to exist, sets its value the way React
+ * needs (native setter + input event), and KEEPS RE-DISPATCHING until
+ * React actually ingests it — the input exists in the SSR HTML before
+ * hydration, so a single early event is swallowed and the Convert
+ * button stays disabled. We stop as soon as the Convert button turns
+ * enabled (state caught up), or after ~20s. The link is also in the
+ * clipboard; this just saves the paste entirely. */
+const EZ_PREFILL = [
+  '<script>(function(){try{',
+  'var m=/[?&]url=([^&]+)/.exec(location.search);if(!m)return;',
+  'var u=decodeURIComponent(m[1]);if(!/^https?:\\/\\//.test(u))return;',
+  'var n=0,ok=false;var t=setInterval(function(){n++;',
+  'var inp=document.querySelector(\'input[inputmode="url"],input[placeholder*="youtube"],input[placeholder*="paste"]\');',
+  'if(inp){try{',
+  'var set=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,\'value\').set;',
+  'if(inp.value!==u)set.call(inp,u);',
+  'inp.dispatchEvent(new Event(\'input\',{bubbles:true}));',
+  'inp.dispatchEvent(new Event(\'change\',{bubbles:true}));',
+  'var bs=document.querySelectorAll(\'button[type="submit"]\');',
+  'for(var i=0;i<bs.length;i++){var b=bs[i];',
+  'if(/convert|download|start/i.test(b.textContent||b.innerText||\'\')&&!b.disabled){ok=true;break}}',
+  '}catch(e){try{inp.value=u}catch(e2){}}',
+  'if(ok||n>80)clearInterval(t);',
+  '}else if(n>80){clearInterval(t)}},250);',
+  '}catch(e){}})();</' + 'script>',
+].join('');
+
+/* prefix root-relative attribute URLs in served HTML.
+ * Only matches real attribute syntax (src=" / href=" / action=") — the
+ * escaped JSON inside self.__next_f payloads uses \" so it never
+ * matches, and full URLs / data: / # stay untouched. */
+function ezRewriteHtml(html, origin) {
+  let out = html;
+  const rootAttr = /(\s(?:src|href|action|poster)=")(\/(?!\/)[^"]*)(")/g;
+  out = out.replace(rootAttr, (m, a, p, q) => a + EZ_PREFIX + p + q);
+  /* absolute ezconv.cc URLs → inside the proxy (canonical, og:url,
+     any router-level redirects baked into the HTML) */
+  out = out.split(EZ_SITE + '/').join(origin + EZ_PREFIX + '/');
+  out = out.split('"' + EZ_SITE + '"').join('"' + origin + EZ_PREFIX + '"');
+  /* inject the prefill helper right after <head> so it runs first */
+  if (/<head[^>]*>/i.test(out)) out = out.replace(/<head[^>]*>/i, (m) => m + EZ_PREFILL);
+  else out = EZ_PREFILL + out;
+  return out;
+}
+
+/* rewrite the site's JS so the runtime calls land on this worker.
+ *  - the API base constant ("https://api.ezsrv.net") → /__ezapi
+ *  - absolute ezconv.cc references                → /__ez
+ * Turnstile (challenges.cloudflare.com), fonts, and YouTube oembed
+ * stay DIRECT on purpose: they need the real browser, and the oembed
+ * endpoint reflects any origin so it works from the worker page. */
+function ezRewriteJs(txt, origin) {
+  let out = txt;
+  out = out.split('"' + EZ_API + '"').join('"' + origin + EZ_API_PREFIX + '"');
+  out = out.split("'" + EZ_API + "'").join("'" + origin + EZ_API_PREFIX + "'");
+  out = out.split('"' + EZ_SITE + '"').join('"' + origin + EZ_PREFIX + '"');
+  out = out.split("'" + EZ_SITE + "'").join("'" + origin + EZ_PREFIX + "'");
+  return out;
+}
+
+/* rewrite JSON bodies (convert/status): point downloadUrl at the relay */
+function ezRewriteJson(txt, origin) {
+  let out = txt;
+  /* dl2.ezsrv.net/download?sig=… → /__ezdl/dl2.ezsrv.net/download?sig=…
+   * (any dl* host; plus a generic catch for other ezsrv download CDNs.
+   *  api.ezsrv.net must NOT be caught here — that tier lives at /__ezapi) */
+  out = out.replace(/https?:\/\/(dl[a-z0-9-]*\.ezsrv\.net)\//gi,
+    (m, host) => origin + EZ_DL_PREFIX + '/' + host.toLowerCase() + '/');
+  out = out.replace(/https?:\/\/([a-z0-9.-]+\.ezsrv\.net)\/(download|file|get)\//gi,
+    (m, host, seg) => origin + EZ_DL_PREFIX + '/' + host.toLowerCase() + '/' + seg + '/');
+  return out;
+}
+
+/* ---- site tier: /__ez/<path> → https://ezconv.cc/<path> ---------- *
+ * Serves pages, /_next assets, the manifest, favicon — everything.
+ * HTML and JS get rewritten; RSC responses (text/x-component) pass
+ * through untouched because the router parses them verbatim. */
+async function ezSiteProxy(url, request) {
+  const origin = url.origin;
+  const sub = url.pathname.slice(EZ_PREFIX.length) || '/'; /* "/en/k7x2" */
+  const target = EZ_SITE + sub + (url.search || '');
+
+  /* hop through ezconv.cc's own redirects (e.g. / → /en/k7x2) */
+  let res, hops = 0, finalPath = sub;
+  let next = target;
+  while (hops < 5) {
+    res = await fetch(next, ezUpstreamInit(url, request, EZ_SITE, EZ_SITE + '/'));
+    if (res.status >= 300 && res.status < 400) {
+      const loc = res.headers.get('location');
+      if (!loc) break;
+      let abs;
+      try { abs = new URL(loc, next); } catch (e) { break; }
+      if (abs.origin !== EZ_SITE) {
+        /* off-site redirect (shouldn't happen) — just follow it */
+        res = await fetch(abs.href, ezUpstreamInit(url, request, EZ_SITE, EZ_SITE + '/'));
+        break;
+      }
+      finalPath = abs.pathname;
+      next = EZ_SITE + abs.pathname + abs.search;
+      hops++;
+      continue;
+    }
+    break;
+  }
+  /* if the final path differs, redirect the browser to the matching
+     proxied URL so relative asset resolution stays correct */
+  if (finalPath !== sub && request.method === 'GET') {
+    return new Response(null, {
+      status: 302,
+      headers: { Location: EZ_PREFIX + finalPath + (url.search || ''), 'Access-Control-Allow-Origin': '*' },
+    });
+  }
+
+  const ct = (res.headers.get('content-type') || '').toLowerCase();
+  const isHtml = ct.includes('text/html');
+  const isJs = ct.includes('javascript') || ct.includes('ecmascript') || /\.m?js$/i.test(sub);
+
+  /* cache static assets on the edge (the relay's trick: chunked Next.js
+   * builds are content-hashed, so caching is safe and instant) */
+  const cacheable = request.method === 'GET' && res.status === 200 &&
+    (ct.startsWith('image/') || ct.startsWith('font/') || ct.startsWith('audio/') ||
+     ct.startsWith('video/') || isJs || ct.includes('text/css'));
+
+  if (cacheable) {
+    try {
+      if (typeof caches !== 'undefined' && caches.default) {
+        const hit = await caches.default.match(url.href);
+        if (hit) {
+          const hd = new Headers(hit.headers);
+          hd.set('x-ez-cache', 'HIT');
+          return new Response(hit.body, { status: hit.status, headers: hd });
+        }
+      }
+    } catch (e) { /* cache API unavailable */ }
+  }
+
+  let out = res;
+  if ((isHtml || isJs) && res.status === 200) {
+    try {
+      const txt = await res.text();
+      const patched = isHtml ? ezRewriteHtml(txt, origin) : ezRewriteJs(txt, origin);
+      const hdrs = new Headers();
+      res.headers.forEach((v, k) => {
+        const lk = k.toLowerCase();
+        if (lk !== 'content-length' && lk !== 'content-encoding' && lk !== 'transfer-encoding') hdrs.set(k, v);
+      });
+      hdrs.set('Access-Control-Allow-Origin', '*');
+      if (patched !== txt) hdrs.set('x-ez-rewritten', isHtml ? 'html' : 'js');
+      out = new Response(patched, { status: res.status, statusText: res.statusText, headers: hdrs });
+      if (cacheable && typeof caches !== 'undefined' && caches.default) {
+        try {
+          const put = caches.default.put(url.href, out.clone()).catch(() => {});
+          if (EZ_CTX && EZ_CTX.waitUntil) { try { EZ_CTX.waitUntil(put); } catch (eW) {} }
+          else void put;
+        } catch (e) { /* ignore */ }
+      }
+    } catch (e) { /* body unreadable — serve as-is */ }
+  } else {
+    out = ezRebuild(res, {
+      'Cache-Control': cacheable ? 'public, max-age=3600' : (res.headers.get('cache-control') || 'no-store'),
+    });
+    if (out.headers.get('content-type') === null) out.headers.set('Content-Type', 'application/octet-stream');
+    if (cacheable && typeof caches !== 'undefined' && caches.default) {
+      try {
+        const put = caches.default.put(url.href, out.clone()).catch(() => {});
+        if (EZ_CTX && EZ_CTX.waitUntil) { try { EZ_CTX.waitUntil(put); } catch (eW) {} }
+        else void put;
+      } catch (e) { /* ignore */ }
+    }
+  }
+  if (isHtml && out.headers.get('cache-control') !== 'no-store') {
+    out.headers.set('Cache-Control', 'no-store'); /* pages always fresh */
+  }
+  return out;
+}
+
+/* ---- API tier: /__ezapi/<path> → https://api.ezsrv.net/<path> ----- *
+ * POST attest/convert, GET status — body passthrough, JSON download
+ * URLs rewritten to the /__ezdl relay, CORS wide open. */
+async function ezApiProxy(url, request) {
+  const origin = url.origin;
+  const sub = url.pathname.slice(EZ_API_PREFIX.length) || '/'; /* "/api/convert" */
+  const target = EZ_API + sub + (url.search || '');
+
+  const res = await fetch(target, ezUpstreamInit(url, request, EZ_SITE, EZ_SITE + '/'));
+  const ct = (res.headers.get('content-type') || '').toLowerCase();
+
+  if (res.status === 200 && ct.includes('application/json')) {
+    try {
+      const txt = await res.text();
+      const patched = ezRewriteJson(txt, origin);
+      const hdrs = new Headers();
+      res.headers.forEach((v, k) => {
+        const lk = k.toLowerCase();
+        if (lk !== 'content-length' && lk !== 'content-encoding' && lk !== 'transfer-encoding') hdrs.set(k, v);
+      });
+      hdrs.set('Content-Type', 'application/json; charset=utf-8');
+      hdrs.set('Access-Control-Allow-Origin', '*');
+      hdrs.set('Cache-Control', 'no-store');
+      if (patched !== txt) hdrs.set('x-ez-rewritten', 'json');
+      return new Response(patched, { status: res.status, statusText: res.statusText, headers: hdrs });
+    } catch (e) { /* fall through to passthrough */ }
+  }
+  return ezRebuild(res, { 'Cache-Control': 'no-store' });
+}
+
+/* ---- download tier: /__ezdl/<host>/<path> ------------------------- *
+ * Streams converted MP3/MP4 files from dl*.ezsrv.net through the
+ * worker: Range passthrough (seekable), Content-Disposition preserved
+ * (the real filename), CORS open so the page can trigger the save.
+ * Only *.ezsrv.net hosts are allowed — this is not an open proxy. */
+async function ezDlProxy(url, request) {
+  const rest = url.pathname.slice(EZ_DL_PREFIX.length + 1); /* "dl2.ezsrv.net/download" */
+  const slash = rest.indexOf('/');
+  if (slash < 1) return json({ error: 'expected /__ezdl/<host>/<path>' }, { status: 400 });
+  const host = rest.slice(0, slash).toLowerCase();
+  const pathPart = rest.slice(slash);
+  if (!EZ_DL_HOST_RE.test(host)) {
+    return json({ error: 'only ezsrv.net download hosts are proxied' }, { status: 403 });
+  }
+  const target = 'https://' + host + pathPart + (url.search || '');
+
+  const headers = new Headers();
+  for (const name of ['range', 'accept', 'accept-language']) {
+    const v = request.headers.get(name);
+    if (v) headers.set(name, v);
+  }
+  headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+  headers.set('Referer', EZ_SITE + '/');
+
+  const res = await fetch(target, { headers, redirect: 'follow', credentials: 'omit' });
+  const out = new Headers();
+  res.headers.forEach((v, k) => {
+    const lk = k.toLowerCase();
+    if (lk !== 'content-encoding' && lk !== 'transfer-encoding' && lk !== 'content-length' &&
+        lk !== 'set-cookie' && lk !== 'strict-transport-security' && lk !== 'report-to' && lk !== 'nel') {
+      out.set(k, v);
+    }
+  });
+  /* keep the download an attachment no matter what upstream says */
+  if (!out.get('Content-Disposition')) {
+    const fn = decodeURIComponent((pathPart.split('/').pop() || 'download').split('?')[0]).slice(0, 120) || 'download';
+    out.set('Content-Disposition', 'attachment; filename="' + fn.replace(/[\r\n"\\/]/g, '_') + '"');
+  }
+  out.set('Access-Control-Allow-Origin', '*');
+  out.set('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length, Content-Type');
+  out.set('Cache-Control', 'no-store');
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers: out });
 }
