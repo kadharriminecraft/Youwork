@@ -1,5 +1,5 @@
 /* =====================================================================
-   YT-ONLY WORKER v1.3 — a dedicated Cloudflare Worker purpose-built for
+   YT-ONLY WORKER v1.5 — a dedicated Cloudflare Worker purpose-built for
    the YT-Only app (the stripped-down YouTube-only player).
 
    Deploy on YOUR Cloudflare account (free tier is fine):
@@ -9,9 +9,12 @@
      4. In the app: Settings (gear) → paste the URL → Save → Test connection
 
    What this worker does:
-     - /__yt/health           → version probe ("yt-only-ok/1.3")
+     - /__yt/health           → version probe ("yt-only-ok/1.5")
      - /__yt/search?q=QUERY   → JSON { videos:[...], channels:[...] }
+       v1.5: three sources RACE IN PARALLEL (innertube ANDROID_VR API +
+       HTML scrape + Piped) — fast AND throttle-proof.
      - /__yt/video?id=VID     → JSON { id,title,description,views,date,channel,related }
+       v1.5: watch scrape + innertube player + Piped race in parallel.
      - /__yt/home             → JSON { videos:[...] } (popular feed)
      - /__yt/channel?id=|handle= → JSON { header, videos:[...] }
      - /__yt/dl?id=VID&type=audio|video → streams the file through this
@@ -19,6 +22,65 @@
        it directly from YOUR worker — no external site needed.
      - /__yt/img?url=URL      → passthrough image proxy
      - /__yt/proxy?url=URL    → generic CORS proxy
+
+   v1.4 ALSO PROXIES THE EZCONV CONVERTER WEBSITE (same idea as the
+   "Relay" proxy browser's super worker, specialized for one site):
+     - /__ez/<path>           → https://ezconv.cc/<path>
+       The real ezconv.cc page — HTML rewritten so every asset, link and
+       SPA route stays inside the proxy. Opens even when ezconv.cc is
+       blocked on your network, because it loads from YOUR worker.
+     - /__ezapi/<path>        → https://api.ezsrv.net/<path>
+       The converter API (attest / convert / status) — proxied and
+       CORS-unlocked. The page's own JS is rewritten to call this.
+     - /__ezdl/<host>/<path>  → https://<host>/<path> (dl*.ezsrv.net only)
+       Download relay for converted files: streams the MP3/MP4 through
+       the worker with the original filename + Range support.
+     - anything else at root  → 302 into /__ez — so the Next.js SPA's
+       own runtime fetches (un-prefixed /_next/…, RSC routes) always
+       land back inside the proxy. The worker root IS the converter:
+       just open https://YOUR.WORKER/ and ezconv appears, unblocked.
+
+   WHAT CHANGED IN v1.5 (fast reliable search/metadata + in-app downloads):
+     1. SEARCH IS RACED, NOT SEQUENCED. Root cause of "takes forever and
+        shows no results": v1.4 scraped youtube.com/results first — when
+        the Worker's datacenter IP is 429-throttled that scrape burns
+        15-20s BEFORE the Piped fallback even starts. v1.5 fires THREE
+        tiers at once and the first good answer wins:
+          a) innertube ANDROID_VR /youtubei/v1/search — an API endpoint
+             (not an HTML page) that does NOT get 429-throttled on
+             datacenter IPs; ~0.4s, videos + channel chips, and we pull
+             the continuation page for ~2x results.
+          b) youtube.com/results HTML scrape — richest (~70 videos).
+          c) Piped instances raced in parallel.
+        Searches are also cached for 10 minutes.
+     2. VIDEO METADATA IS RACED the same way: /watch scrape vs innertube
+        ANDROID_VR player (+/next related) vs Piped /streams — the best
+        answer inside ~2s wins; search-by-ID scrape and oEmbed remain
+        last-resort rescues. This fixes "fails to load metadata".
+     3. EVERY upstream fetch is HARD-TIMEOUTED (6s default per attempt).
+        The old plain fetch() could hang for tens of seconds per retry.
+     4. IN-APP DOWNLOADER API — the app's Download panel now converts
+        without ever opening the ezconv website:
+          GET /__ezc/convert?url=<yt link>&format=mp3&quality=128
+              → worker does attest → POST api.ezsrv.net/api/convert →
+                returns { jobId }
+          GET /__ezc/status?jobId=… → polls progress; when done, hands
+              back a downloadUrl ALREADY REWRITTEN to /__ezdl (the
+              allowlisted file relay) + the proper filename.
+        The browser only ever talks to THIS worker — no direct calls to
+        ezconv.cc or api.ezsrv.net, so org blockers can't touch it.
+     5. The /__ez full-site proxy (v1.4) stays as a fallback entrance;
+        /__yt/dl (direct stream download) also stays as a backup.
+
+  WHAT CHANGED IN v1.4 (ezconv site-proxy integration):
+     1. EZCONV SITE PROXY — the app's Download button now opens the real
+        ezconv.cc converter THROUGH this worker (Relay-style): HTML/JS
+        rewriting (assets, links, API base, download hosts), RSC/Next.js
+        router passthrough, forced-download relay for converted files.
+     2. The video link is copied to the clipboard on the way out AND
+        auto-pasted into the converter's input (?url=… prefill script).
+     3. All v1.3 YouTube endpoints unchanged — search / video / home /
+        channel / dl keep the Piped + innertube fallback chains.
 
    WHAT CHANGED IN v1.3 (channel reliability + fast reliable downloads):
      1. CHANNELS — ported from the Relay browser app, whose channel code
@@ -87,7 +149,7 @@
    ===================================================================== */
 
 /* ----- version + config -------------------------------------------- */
-const VERSION = '1.3';
+const VERSION = '1.5';
 const HEALTH_TAG = 'yt-only-ok/' + VERSION;
 const YT_HOME = 'https://www.youtube.com';
 
@@ -182,6 +244,28 @@ const UPSTREAM_HEADERS = {
   'Cookie': 'SOCS=CAI; CONSENT=YES+cb.20210328-17-p0.en+FX+419',
 };
 
+/* ----- ezconv.cc proxy config (v1.4) -------------------------------- *
+ * The converter the app's Download button opens. Three upstreams:
+ *   EZ_SITE  — the Next.js website (pages, assets, RSC routes)
+ *   EZ_API   — the conversion API (attest/convert/status/notice)
+ *   EZ_DL_RE — download CDNs (dl1/dl2/… .ezsrv.net) for converted files
+ * The page's JS chunks are rewritten so every fetch it makes lands on
+ * this worker; JSON responses have their downloadUrl rewritten the
+ * same way. Everything else (fonts, turnstile) stays direct. */
+const EZ_SITE = 'https://ezconv.cc';
+const EZ_API = 'https://api.ezsrv.net';
+const EZ_DL_HOST_RE = /^[a-z0-9.-]*\.ezsrv\.net$/i;
+const EZ_PREFIX = '/__ez';
+const EZ_API_PREFIX = '/__ezapi';
+const EZ_DL_PREFIX = '/__ezdl';
+/* headers forwarded between the browser and the two ezconv upstreams —
+ * includes the full Next.js RSC set so client-side navigation works */
+const EZ_FORWARD_REQ = new Set([
+  'accept', 'accept-language', 'range', 'if-none-match', 'if-modified-since',
+  'content-type', 'rsc', 'next-router-state-tree', 'next-router-prefetch',
+  'next-router-segment-prefetch', 'next-url', 'next-action', 'next-test-data',
+]);
+
 /* ----- CORS -------------------------------------------------------- */
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -204,8 +288,11 @@ function text(s, init) {
 }
 
 /* ----- main entry -------------------------------------------------- */
+let EZ_CTX = null; /* execution context (waitUntil) for cache writes */
+
 export default {
-  async fetch(request) {
+  async fetch(request, env, ctx) {
+    EZ_CTX = ctx || null;
     return handleRequest(request);
   },
 };
@@ -223,72 +310,100 @@ async function handleRequest(request) {
     /* health -------------------------------------------------------- */
     if (path === '/__yt/health') return text(HEALTH_TAG);
 
-    /* search -------------------------------------------------------- */
+    /* search -------------------------------------------------------- *
+     * v1.5: THREE sources race in PARALLEL and the best answer wins:
+     *   1) innertube ANDROID_VR — API endpoint, immune to the 429
+     *      throttling that kills HTML scrapes on Worker IPs (~0.4s)
+     *   2) youtube.com/results scrape — richest result (~70 videos)
+     *   3) Piped — a completely independent network path
+     * v1.4 ran these SEQUENTIALLY, so one throttled scrape burned 15-20s
+     * before the fallbacks even started ("takes forever, no results"). */
     if (path === '/__yt/search') {
       const q = (url.searchParams.get('q') || '').trim();
       if (!q) return json({ error: 'missing q', videos: [], channels: [] });
-      /* 1) youtube.com/results scrape (videos + channel renderers) */
-      try {
-        const html = await fetchUpstream(YT_HOME + '/results?search_query=' + encodeURIComponent(q) + '&hl=en&gl=US');
-        const data = extractYtInitialData(html);
-        const videos = collectVideos(data);
-        if (videos.length) {
-          const channels = collectChannels(data);
-          return json({ query: q, videos, channels });
-        }
-      } catch (e) { /* fall through to Piped */ }
-      /* 2) Piped — videos + channels raced in parallel */
-      const pv = await pipedSearch(q);
-      let pc = [];
-      try {
-        const jc = await pipedGet('/search?q=' + encodeURIComponent(q) + '&filter=channels', j => j && Array.isArray(j.items) && j.items.length);
-        pc = (jc.items || []).map(pipedItemToChannel).filter(Boolean).slice(0, 6);
-      } catch (e) { /* channels are optional */ }
-      return json({ query: q, videos: pv, channels: pc });
+      const cacheKey = 'search:' + q.toLowerCase();
+      const hit = cacheGet(cacheKey);
+      if (hit) return json(hit);
+      const result = await raceTiers([
+        async () => {
+          const r = await innertubeSearch(q);
+          if (!r.videos.length) throw new Error('innertube empty');
+          return { query: q, videos: r.videos, channels: r.channels };
+        },
+        async () => {
+          const html = await fetchUpstream(YT_HOME + '/results?search_query=' + encodeURIComponent(q) + '&hl=en&gl=US');
+          const data = extractYtInitialData(html);
+          const videos = collectVideos(data);
+          if (!videos.length) throw new Error('scrape empty');
+          return { query: q, videos, channels: collectChannels(data) };
+        },
+        async () => {
+          const pv = await pipedSearch(q);
+          if (!pv.length) throw new Error('piped empty');
+          let pc = [];
+          try {
+            const jc = await pipedGet('/search?q=' + encodeURIComponent(q) + '&filter=channels', j => j && Array.isArray(j.items) && j.items.length);
+            pc = (jc.items || []).map(pipedItemToChannel).filter(Boolean).slice(0, 6);
+          } catch (e) { /* channels are optional */ }
+          return { query: q, videos: pv, channels: pc };
+        },
+      ], { settleMs: 1800, minRich: 25, rank: x => (x.videos || []).length });
+      if (result && result.videos && result.videos.length) {
+        cacheSet(cacheKey, result, 600000);
+        return json(result);
+      }
+      return json({ query: q, videos: [], channels: [], error: 'no source answered — try again' }, { status: 502 });
     }
 
-    /* video metadata — full /watch page parse, with fallback chain -- */
+    /* video metadata -------------------------------------------------- *
+     * v1.5: the three strong sources race IN PARALLEL:
+     *   1) /watch HTML scrape — richest (avatar, subs, exact date)
+     *   2) innertube ANDROID_VR player — throttle-proof + fast, fetches
+     *      related via /next
+     *   3) Piped /streams — independent path, full channel info
+     * First "rich" answer wins instantly; otherwise the best of whatever
+     * arrived within ~2s. The v1.4 sequential chain could burn 20s+ on
+     * a throttled scrape before reaching the fallbacks ("metadata
+     * fails to load"). The search-by-ID scrape + oEmbed stay as last
+     * sequential rescues. */
     if (path === '/__yt/video') {
       const id = (url.searchParams.get('id') || '').trim();
       if (!id) return json({ error: 'missing id' });
       const cacheKey = 'video:' + id;
       const hit = cacheGet(cacheKey);
       if (hit) return json(hit);
-      let data = null, lastErr = null;
-      /* 1) HTML scrape (richest data: banner, exact dates, subs) */
-      try {
-        const html = await fetchUpstream(YT_HOME + '/watch?v=' + encodeURIComponent(id) + '&hl=en');
-        data = parseWatchPage(html, id);
-      } catch (e) { lastErr = e; }
-      /* 2) search-by-ID scrape — KEY v1.3 insight: YouTube 429-throttles
-         /watch pages from datacenter IPs but NOT /results pages. Searching
-         the video id itself returns the video as the first result with
-         title, channelId, views, date, duration; the remaining results
-         serve as "Up next". This keeps metadata loading when /watch is
-         blocked. */
+      const rank = d => (d && d.title ? 100 : 0) + ((d && d.related) ? d.related.length : 0) +
+        ((d && d.channel && d.channel.avatar) ? 10 : 0) + ((d && d.channel && d.channel.subs) ? 5 : 0);
+      let data = await raceTiers([
+        async () => {
+          const html = await fetchUpstream(YT_HOME + '/watch?v=' + encodeURIComponent(id) + '&hl=en');
+          const d = parseWatchPage(html, id);
+          if (!d || !d.title) throw new Error('watch scrape empty');
+          return d;
+        },
+        async () => {
+          const iv = await innertubePlayer(id, 8000);
+          if (iv && iv.videoDetails && iv.videoDetails.title) {
+            const d = await innertubeToVideo(iv, id);
+            if (d.related && d.related.length) return d;
+            return d; /* related fetched async inside; even sparse is usable */
+          }
+          throw new Error('innertube player empty');
+        },
+        async () => {
+          const pd = await pipedStreams(id);
+          if (pd && pd.title) return pipedToVideo(pd, id);
+          throw new Error('piped empty');
+        },
+      ], { settleMs: 2000, minRich: 130, rank });
+      /* rescue tiers — search-by-ID scrape (works when /watch is 429'd
+         but /results isn't), then oEmbed (nearly always up) */
       if (!data || !data.title) {
         try {
           const html = await fetchUpstream(YT_HOME + '/results?search_query=' + encodeURIComponent(id) + '&hl=en&gl=US');
           data = parseSearchVideoMeta(extractYtInitialData(html), id);
         } catch (e) { /* keep going */ }
       }
-      /* 3) Piped API — works even when YouTube throttles our IP */
-      if (!data || !data.title) {
-        try {
-          const pd = await pipedStreams(id);
-          if (pd && pd.title) data = pipedToVideo(pd, id);
-        } catch (e) { /* keep going */ }
-      }
-      /* 4) innertube ANDROID_VR player (metadata) + /next (related) */
-      if (!data || !data.title) {
-        try {
-          const iv = await innertubePlayer(id);
-          if (iv && iv.videoDetails && iv.videoDetails.title) {
-            data = await innertubeToVideo(iv, id);
-          }
-        } catch (e) { /* keep going */ }
-      }
-      /* 5) oEmbed — nearly always up, gives at least title + channel */
       if (!data || !data.title) {
         try {
           data = await oembedVideo(id);
@@ -298,7 +413,7 @@ async function handleRequest(request) {
         cacheSet(cacheKey, data, 180000);
         return json(data);
       }
-      return json({ error: 'video unavailable: ' + (lastErr ? lastErr.message : 'no source answered') }, { status: 502 });
+      return json({ error: 'video unavailable: no source answered' }, { status: 502 });
     }
 
     /* download — stream video (MP4 with audio) or audio (M4A) ------- */
@@ -306,15 +421,29 @@ async function handleRequest(request) {
       return await handleDownload(url, request);
     }
 
-    /* home feed (popular playlist) ---------------------------------- */
+    /* home feed (popular playlist) ---------------------------------- *
+     * v1.5: playlist scrape and Piped trending now race in parallel. */
     if (path === '/__yt/home') {
-      try {
-        const html = await fetchUpstream(YT_HOME + '/playlist?list=' + HOME_PLAYLIST + '&hl=en');
-        const videos = collectVideos(extractYtInitialData(html), null, 40);
-        if (videos.length) return json({ videos });
-      } catch (e) { /* fall through to Piped trending */ }
-      const tv = await pipedTrending();
-      return json({ videos: tv.slice(0, 40) });
+      const hit = cacheGet('home:1');
+      if (hit) return json(hit);
+      const result = await raceTiers([
+        async () => {
+          const html = await fetchUpstream(YT_HOME + '/playlist?list=' + HOME_PLAYLIST + '&hl=en');
+          const videos = collectVideos(extractYtInitialData(html), null, 40);
+          if (!videos.length) throw new Error('playlist empty');
+          return { videos };
+        },
+        async () => {
+          const tv = await pipedTrending();
+          if (!tv.length) throw new Error('piped trending empty');
+          return { videos: tv.slice(0, 40) };
+        },
+      ], { settleMs: 1800, minRich: 30, rank: x => (x.videos || []).length });
+      if (result && result.videos && result.videos.length) {
+        cacheSet('home:1', result, 300000);
+        return json(result);
+      }
+      return json({ videos: [] }, { status: 502 });
     }
 
     /* channel page -------------------------------------------------- *
@@ -455,6 +584,61 @@ async function handleRequest(request) {
       });
     }
 
+    /* =============================================================== *
+     * ezconv.cc converter proxy (v1.4) — Relay-style, single-site.
+     * See the ezProxy section near the bottom for the rewriting logic.
+     * =============================================================== */
+    /* v1.5: converter API for the IN-APP downloader. The app calls ONLY
+     * these two routes; the worker performs the whole ezconv API
+     * handshake (attest → convert → status) on its side and hands back
+     * a downloadUrl already rewritten to /__ezdl. No ezconv/ezsrv
+     * request ever leaves for the user's browser. */
+    if (path === '/__ezc/convert' || path === '/__ezc/status') {
+      return await ezcApi(url, request);
+    }
+    /* API tier: /__ezapi/<path> → https://api.ezsrv.net/<path> */
+    if (path === EZ_API_PREFIX || path.startsWith(EZ_API_PREFIX + '/')) {
+      return await ezApiProxy(url, request);
+    }
+    /* download tier: /__ezdl/<host>/<path> → https://<host>/<path> */
+    if (path === EZ_DL_PREFIX || path.startsWith(EZ_DL_PREFIX + '/')) {
+      return await ezDlProxy(url, request);
+    }
+    /* site tier: /__ez/<path> → https://ezconv.cc/<path> */
+    if (path === EZ_PREFIX || path.startsWith(EZ_PREFIX + '/')) {
+      return await ezSiteProxy(url, request);
+    }
+
+    /* root catch-all → the converter (v1.4).
+     * The worker has no content outside /__yt and /__ez*, so ANY other
+     * GET (or HEAD) is a Next.js runtime fetch that lost its /__ez
+     * prefix — an un-rewritten <a href>, an RSC route the router built
+     * from the flight payload, a webpack chunk load at /_next/….
+     * 302 it back inside the proxy so the SPA never falls out.
+     * Non-GET (server actions POSTs) keep their method via 307. */
+    if (path !== '/' && !path.startsWith('/__yt') && !path.startsWith('/__ez')) {
+      const dest = EZ_PREFIX + path + (url.search || '');
+      return new Response(null, {
+        status: (request.method === 'GET' || request.method === 'HEAD') ? 302 : 307,
+        headers: {
+          'Location': dest,
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'no-store',
+        },
+      });
+    }
+    /* bare "/" → the converter home (ezconv.cc/ 307s to /en/k7x2) */
+    if (path === '/') {
+      return new Response(null, {
+        status: 302,
+        headers: {
+          'Location': EZ_PREFIX + '/en/k7x2',
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'no-store',
+        },
+      });
+    }
+
     return text('not found', { status: 404 });
   } catch (e) {
     return json({ error: String(e && e.message || e) }, { status: 500 });
@@ -464,14 +648,17 @@ async function handleRequest(request) {
 /* ----- upstream fetch --------------------------------------------- *
  * Retries with backoff — YouTube intermittently throttles bursts of
  * datacenter-IP requests (429) or answers with a redirect-to-consent.
- * Waiting and retrying resolves the vast majority of those. */
-async function fetchUpstream(u) {
+ * v1.5: every upstream page fetch is now HARD-TIMEOUTED (ms, default
+ * 6s). v1.4's plain fetch could hang for tens of seconds per attempt
+ * when YouTube throttles the Worker's IP — that's what made search
+ * "take forever". Retries are kept, but the total tier time is bounded. */
+async function fetchUpstream(u, ms) {
   const DELAYS = [0, 500, 1300];
   let lastErr = null;
   for (let attempt = 0; attempt < DELAYS.length; attempt++) {
     if (DELAYS[attempt]) await new Promise(res => setTimeout(res, DELAYS[attempt]));
     try {
-      const r = await fetch(u, { headers: UPSTREAM_HEADERS, redirect: 'follow' });
+      const r = await fetchTimeout(u, { headers: UPSTREAM_HEADERS, redirect: 'follow' }, ms || 6000);
       if (r.ok) return r.text();
       lastErr = new Error('upstream ' + r.status + ' for ' + u);
     } catch (e) {
@@ -479,6 +666,44 @@ async function fetchUpstream(u) {
     }
   }
   throw lastErr || new Error('upstream failed for ' + u);
+}
+
+/* v1.5 helper: race several async source-tiers and pick the best one.
+   - settle ms      → how long we wait for the SLOW-but-RICH tier
+   - minRich        → a result this good wins INSTANTLY
+   - rank(x)        → "richness" score (more = better)
+   The v1.4 code ran its tiers SEQUENTIALLY: a throttled scrape burned
+   its whole timeout before Piped/innertube even started. Racing means
+   the user gets the FIRST usable answer, and the richest one that
+   arrives within the grace window. */
+async function raceTiers(tiers, opts) {
+  const o = opts || {};
+  const settleMs = o.settleMs != null ? o.settleMs : 2600;
+  const minRich = o.minRich != null ? o.minRich : 1;
+  const rank = o.rank || (x => (x && x.videos ? x.videos.length : 0));
+  const jobs = tiers.map(fn => Promise.resolve().then(fn).then(
+    val => ({ ok: true, val }),
+    err => ({ ok: false, err })
+  ));
+  return new Promise(resolve => {
+    let best = null, bestRank = -1, pending = jobs.length, settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve(best ? best.val : null);
+    };
+    const timer = setTimeout(finish, settleMs + 30000); /* absolute cap */
+    const early = setTimeout(() => { if (best) finish(); }, settleMs);
+    jobs.forEach(j => j.then(r => {
+      pending--;
+      if (r.ok && r.val && rank(r.val) > 0) {
+        const rk = rank(r.val);
+        if (rk > bestRank) { best = r; bestRank = rk; }
+        if (rk >= minRich) { clearTimeout(early); clearTimeout(timer); finish(); }
+      }
+      if (pending === 0) { clearTimeout(early); clearTimeout(timer); finish(); }
+    }));
+  });
 }
 
 /* ----- HTML → JSON parsing -----------------------------------------
@@ -586,6 +811,11 @@ function collectVideos(data, excludeId, limit) {
   if (!data) return [];
   const out = [];
   const seen = {};
+  /* v1.5: shorts shelves can carry 60+ shortsLockupViewModels that flood
+     a vertical grid (search results were ~2/3 shorts). Cap them like
+     YouTube's own horizontal shelf would. */
+  const MAX_SHORTS = 12;
+  let shorts = 0;
 
   function visit(node) {
     if (!node || typeof node !== 'object') return;
@@ -597,7 +827,11 @@ function collectVideos(data, excludeId, limit) {
     else if (node.gridVideoRenderer) v = extractVideoRenderer(node.gridVideoRenderer);
     else if (node.playlistVideoRenderer) v = extractVideoRenderer(node.playlistVideoRenderer);
     else if (node.lockupViewModel) v = extractLockupViewModel(node.lockupViewModel);
-    else if (node.shortsLockupViewModel) v = extractShortsLockup(node.shortsLockupViewModel);
+    else if (node.shortsLockupViewModel) {
+      if (shorts >= MAX_SHORTS) return; /* skip the whole subtree walk below too */
+      v = extractShortsLockup(node.shortsLockupViewModel);
+      if (v) shorts++;
+    }
 
     if (v && v.id && v.id !== excludeId && !seen[v.id]) {
       seen[v.id] = 1;
@@ -1259,6 +1493,102 @@ async function innertubeNext(videoId) {
   } catch (e) { return null; }
 }
 
+/* v1.5 — innertube SEARCH with the ANDROID_VR client. This is THE fix
+   for "search takes forever and shows no results":
+     - it hits /youtubei/v1/search (an API endpoint, not an HTML page),
+       so it does NOT suffer the 429/consent-shell throttling that
+       youtube.com/results gets on datacenter (Worker) IPs;
+     - it answers in ~0.4s;
+     - it returns both videos (compactVideoRenderer) and channel chips
+       (compactChannelRenderer).
+   ANDROID_VR caps a page at ~20 results, so we also pull the
+   continuation page (another ~20) and merge. */
+function innertubeSearchParse(j) {
+  const videos = [], channels = [];
+  let continuation = null;
+  const seen = new Set();
+  const walk = (node, depth) => {
+    if (!node || typeof node !== 'object' || depth > 9) return;
+    if (Array.isArray(node)) { for (const x of node) walk(x, depth + 1); return; }
+    if (node.compactVideoRenderer || node.videoRenderer) {
+      const r = node.compactVideoRenderer || node.videoRenderer;
+      const id = r.videoId;
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        const thumbs = (r.thumbnail && r.thumbnail.thumbnails) || [];
+        const owner = (r.shortBylineText || r.longBylineText || r.ownerText || { runs: [] }).runs || [];
+        videos.push({
+          id,
+          title: textOf(r.title),
+          thumb: thumbs.length ? thumbs[thumbs.length - 1].url : 'https://i.ytimg.com/vi/' + id + '/hqdefault.jpg',
+          channel: owner.length ? owner[0].text : '',
+          channelId: (owner[0] && owner[0].navigationEndpoint && owner[0].navigationEndpoint.browseEndpoint &&
+            owner[0].navigationEndpoint.browseEndpoint.browseId) || '',
+          duration: textOf(r.lengthText),
+          views: textOf(r.shortViewCountText) || textOf(r.viewCountText),
+          date: textOf(r.publishedTimeText),
+        });
+      }
+    }
+    if (node.compactChannelRenderer || node.channelRenderer) {
+      const r = node.compactChannelRenderer || node.channelRenderer;
+      const cid = r.channelId;
+      if (cid && !seen.has('c:' + cid)) {
+        seen.add('c:' + cid);
+        const cthumbs = (r.thumbnail && r.thumbnail.thumbnails) || [];
+        let avatar = cthumbs.length ? cthumbs[cthumbs.length - 1].url : '';
+        if (avatar && avatar.indexOf('//') === 0) avatar = 'https:' + avatar;
+        channels.push({
+          id: cid,
+          name: textOf(r.title) || textOf(r.displayName),
+          avatar,
+          subs: textOf(r.subscriberCountText),
+          url: 'https://www.youtube.com/channel/' + cid,
+        });
+      }
+    }
+    if (node.continuationItemRenderer && node.continuationItemRenderer.continuationEndpoint &&
+      node.continuationItemRenderer.continuationEndpoint.continuationCommand) {
+      continuation = node.continuationItemRenderer.continuationEndpoint.continuationCommand.token;
+    }
+    for (const k of Object.keys(node)) walk(node[k], depth + 1);
+  };
+  if (j && j.contents) walk(j.contents, 0);
+  if (j && j.onResponseReceivedCommands) walk(j.onResponseReceivedCommands, 0);
+  return { videos, channels, continuation };
+}
+
+async function innertubeSearchRaw(body, ms) {
+  const r = await fetchTimeout('https://www.youtube.com/youtubei/v1/search?prettyPrint=false', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'User-Agent': VR_UA },
+    body: JSON.stringify(body),
+  }, ms || 9000);
+  if (!r.ok) throw new Error('innertube search ' + r.status);
+  return r.json();
+}
+
+async function innertubeSearch(q) {
+  const j1 = await innertubeSearchRaw({ context: VR_CONTEXT, query: q });
+  const out = innertubeSearchParse(j1);
+  /* continuation page 2 — merged only if it arrives fast (1.6s cap);
+     a slow second page never delays the user's results */
+  if (out.continuation && out.videos.length) {
+    try {
+      const j2 = await Promise.race([
+        innertubeSearchRaw({ context: VR_CONTEXT, continuation: out.continuation }),
+        new Promise((res, rej) => setTimeout(() => rej(new Error('page2 slow')), 1600)),
+      ]);
+      const p2 = innertubeSearchParse(j2);
+      const have = new Set(out.videos.map(v => v.id));
+      for (const v of p2.videos) if (!have.has(v.id)) out.videos.push(v);
+      const chv = new Set(out.channels.map(c => c.id));
+      for (const c of p2.channels) if (!chv.has(c.id)) out.channels.push(c);
+    } catch (e) { /* page 2 optional */ }
+  }
+  return { videos: out.videos, channels: out.channels };
+}
+
 /* Map a Piped /streams response onto the app's watch-page shape. */
 function pipedToVideo(pd, id) {
   const chId = chIdFromPipedUrl(pd.uploaderUrl);
@@ -1505,4 +1835,462 @@ function sanitizeFilename(name) {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 80) || 'download';
+}
+
+/* =================================================================== *
+ * EZCONV PROXY (v1.4) — the Relay-style single-site proxy browser.
+ * The app's Download button opens /__ez/en/k7x2?url=<video link> on
+ * this worker; the real ezconv.cc boots, entirely through the worker:
+ *
+ *   /__ez/<path>      → EZ_SITE pages/assets  (HTML + JS rewritten)
+ *   /__ezapi/<path>   → EZ_API                (attest/convert/status)
+ *   /__ezdl/<h>/<p>   → dl*.ezsrv.net         (converted file download)
+ *   /<anything else>  → 302 → /__ez/…         (SPA safety net, above)
+ *
+ * Rewriting rules, in order:
+ *   HTML  — src="/x" / href="/x"  → prefixed with /__ez
+ *           https://ezconv.cc/x   → /__ez/x
+ *           + a ?url= prefill script (pastes the video link into the
+ *             converter input for the user)
+ *   JS    — "https://api.ezsrv.net"     → <origin>/__ezapi
+ *           "https://ezconv.cc"         → <origin>/__ez
+ *           (turnstile + fonts + oembed stay direct — they must)
+ *   JSON  — "https://dl2.ezsrv.net/…"   → <origin>/__ezdl/dl2.ezsrv.net/…
+ *           so the Download button on the page hits the worker, which
+ *           relays the bytes as a real attachment.
+ * =================================================================== */
+
+/* build the upstream request for an ezconv upstream, forwarding the
+ * Next.js RSC headers + body so SPA navigation and POSTs survive */
+function ezUpstreamInit(url, request, origin, referer) {
+  const headers = new Headers();
+  for (const name of EZ_FORWARD_REQ) {
+    const v = request.headers.get(name);
+    if (v) headers.set(name, v);
+  }
+  headers.set('User-Agent', request.headers.get('user-agent') ||
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+  headers.set('Origin', origin);
+  if (referer) headers.set('Referer', referer);
+  if (!headers.get('Accept')) headers.set('Accept', '*/*');
+  if (!headers.get('Accept-Language')) headers.set('Accept-Language', 'en-US,en;q=0.9');
+  const init = {
+    method: (request.method === 'OPTIONS') ? 'GET' : request.method,
+    headers,
+    redirect: 'manual',
+    credentials: 'omit',
+  };
+  if (request.method !== 'GET' && request.method !== 'HEAD' && request.method !== 'OPTIONS') {
+    init.body = request.body;
+    init.duplex = 'half';
+  }
+  return init;
+}
+
+/* rebuild a proxied response: strip frame-blocking / cache-busting
+ * headers, add permissive CORS, keep the content intact */
+function ezRebuild(res, extra) {
+  const out = new Headers();
+  const STRIP = new Set([
+    'content-security-policy', 'content-security-policy-report-only',
+    'x-frame-options', 'strict-transport-security', 'report-to', 'nel',
+    'set-cookie', 'set-cookie2', 'alt-svc', 'cross-origin-opener-policy',
+    'cross-origin-embedder-policy', 'cross-origin-resource-policy',
+    'content-encoding', 'content-length', 'transfer-encoding',
+    'permissions-policy', 'feature-policy', 'x-content-type-options',
+    'cf-ray', 'cf-cache-status', 'server', 'reporting-endpoints',
+  ]);
+  res.headers.forEach((v, k) => { if (!STRIP.has(k.toLowerCase())) out.set(k, v); });
+  out.set('Access-Control-Allow-Origin', '*');
+  out.set('Access-Control-Allow-Methods', 'GET, HEAD, POST, OPTIONS');
+  out.set('Access-Control-Allow-Headers', '*');
+  if (extra) for (const k in extra) out.set(k, extra[k]);
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers: out });
+}
+
+/* ---- the prefill script injected into served HTML ---------------- *
+ * The app opens /__ez/en/k7x2?url=<youtube link>. This script waits
+ * for the converter's <input> to exist, sets its value the way React
+ * needs (native setter + input event), and KEEPS RE-DISPATCHING until
+ * React actually ingests it — the input exists in the SSR HTML before
+ * hydration, so a single early event is swallowed and the Convert
+ * button stays disabled. We stop as soon as the Convert button turns
+ * enabled (state caught up), or after ~20s. The link is also in the
+ * clipboard; this just saves the paste entirely. */
+const EZ_PREFILL = [
+  '<script>(function(){try{',
+  'var m=/[?&]url=([^&]+)/.exec(location.search);if(!m)return;',
+  'var u=decodeURIComponent(m[1]);if(!/^https?:\\/\\//.test(u))return;',
+  'var n=0,ok=false;var t=setInterval(function(){n++;',
+  'var inp=document.querySelector(\'input[inputmode="url"],input[placeholder*="youtube"],input[placeholder*="paste"]\');',
+  'if(inp){try{',
+  'var set=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,\'value\').set;',
+  'if(inp.value!==u)set.call(inp,u);',
+  'inp.dispatchEvent(new Event(\'input\',{bubbles:true}));',
+  'inp.dispatchEvent(new Event(\'change\',{bubbles:true}));',
+  'var bs=document.querySelectorAll(\'button[type="submit"]\');',
+  'for(var i=0;i<bs.length;i++){var b=bs[i];',
+  'if(/convert|download|start/i.test(b.textContent||b.innerText||\'\')&&!b.disabled){ok=true;break}}',
+  '}catch(e){try{inp.value=u}catch(e2){}}',
+  'if(ok||n>80)clearInterval(t);',
+  '}else if(n>80){clearInterval(t)}},250);',
+  '}catch(e){}})();</' + 'script>',
+].join('');
+
+/* prefix root-relative attribute URLs in served HTML.
+ * Only matches real attribute syntax (src=" / href=" / action=") — the
+ * escaped JSON inside self.__next_f payloads uses \" so it never
+ * matches, and full URLs / data: / # stay untouched. */
+function ezRewriteHtml(html, origin) {
+  let out = html;
+  const rootAttr = /(\s(?:src|href|action|poster)=")(\/(?!\/)[^"]*)(")/g;
+  out = out.replace(rootAttr, (m, a, p, q) => a + EZ_PREFIX + p + q);
+  /* absolute ezconv.cc URLs → inside the proxy (canonical, og:url,
+     any router-level redirects baked into the HTML) */
+  out = out.split(EZ_SITE + '/').join(origin + EZ_PREFIX + '/');
+  out = out.split('"' + EZ_SITE + '"').join('"' + origin + EZ_PREFIX + '"');
+  /* inject the prefill helper right after <head> so it runs first */
+  if (/<head[^>]*>/i.test(out)) out = out.replace(/<head[^>]*>/i, (m) => m + EZ_PREFILL);
+  else out = EZ_PREFILL + out;
+  return out;
+}
+
+/* rewrite the site's JS so the runtime calls land on this worker.
+ *  - the API base constant ("https://api.ezsrv.net") → /__ezapi
+ *  - absolute ezconv.cc references                → /__ez
+ * Turnstile (challenges.cloudflare.com), fonts, and YouTube oembed
+ * stay DIRECT on purpose: they need the real browser, and the oembed
+ * endpoint reflects any origin so it works from the worker page. */
+function ezRewriteJs(txt, origin) {
+  let out = txt;
+  out = out.split('"' + EZ_API + '"').join('"' + origin + EZ_API_PREFIX + '"');
+  out = out.split("'" + EZ_API + "'").join("'" + origin + EZ_API_PREFIX + "'");
+  out = out.split('"' + EZ_SITE + '"').join('"' + origin + EZ_PREFIX + '"');
+  out = out.split("'" + EZ_SITE + "'").join("'" + origin + EZ_PREFIX + "'");
+  return out;
+}
+
+/* rewrite JSON bodies (convert/status): point downloadUrl at the relay */
+function ezRewriteJson(txt, origin) {
+  let out = txt;
+  /* dl2.ezsrv.net/download?sig=… → /__ezdl/dl2.ezsrv.net/download?sig=…
+   * (any dl* host; plus a generic catch for other ezsrv download CDNs.
+   *  api.ezsrv.net must NOT be caught here — that tier lives at /__ezapi) */
+  out = out.replace(/https?:\/\/(dl[a-z0-9-]*\.ezsrv\.net)\//gi,
+    (m, host) => origin + EZ_DL_PREFIX + '/' + host.toLowerCase() + '/');
+  out = out.replace(/https?:\/\/([a-z0-9.-]+\.ezsrv\.net)\/(download|file|get)\//gi,
+    (m, host, seg) => origin + EZ_DL_PREFIX + '/' + host.toLowerCase() + '/' + seg + '/');
+  return out;
+}
+
+/* ---- site tier: /__ez/<path> → https://ezconv.cc/<path> ---------- *
+ * Serves pages, /_next assets, the manifest, favicon — everything.
+ * HTML and JS get rewritten; RSC responses (text/x-component) pass
+ * through untouched because the router parses them verbatim. */
+async function ezSiteProxy(url, request) {
+  const origin = url.origin;
+  const sub = url.pathname.slice(EZ_PREFIX.length) || '/'; /* "/en/k7x2" */
+  const target = EZ_SITE + sub + (url.search || '');
+
+  /* hop through ezconv.cc's own redirects (e.g. / → /en/k7x2) */
+  let res, hops = 0, finalPath = sub;
+  let next = target;
+  while (hops < 5) {
+    res = await fetch(next, ezUpstreamInit(url, request, EZ_SITE, EZ_SITE + '/'));
+    if (res.status >= 300 && res.status < 400) {
+      const loc = res.headers.get('location');
+      if (!loc) break;
+      let abs;
+      try { abs = new URL(loc, next); } catch (e) { break; }
+      if (abs.origin !== EZ_SITE) {
+        /* off-site redirect (shouldn't happen) — just follow it */
+        res = await fetch(abs.href, ezUpstreamInit(url, request, EZ_SITE, EZ_SITE + '/'));
+        break;
+      }
+      finalPath = abs.pathname;
+      next = EZ_SITE + abs.pathname + abs.search;
+      hops++;
+      continue;
+    }
+    break;
+  }
+  /* if the final path differs, redirect the browser to the matching
+     proxied URL so relative asset resolution stays correct */
+  if (finalPath !== sub && request.method === 'GET') {
+    return new Response(null, {
+      status: 302,
+      headers: { Location: EZ_PREFIX + finalPath + (url.search || ''), 'Access-Control-Allow-Origin': '*' },
+    });
+  }
+
+  const ct = (res.headers.get('content-type') || '').toLowerCase();
+  const isHtml = ct.includes('text/html');
+  const isJs = ct.includes('javascript') || ct.includes('ecmascript') || /\.m?js$/i.test(sub);
+
+  /* cache static assets on the edge (the relay's trick: chunked Next.js
+   * builds are content-hashed, so caching is safe and instant) */
+  const cacheable = request.method === 'GET' && res.status === 200 &&
+    (ct.startsWith('image/') || ct.startsWith('font/') || ct.startsWith('audio/') ||
+     ct.startsWith('video/') || isJs || ct.includes('text/css'));
+
+  if (cacheable) {
+    try {
+      if (typeof caches !== 'undefined' && caches.default) {
+        const hit = await caches.default.match(url.href);
+        if (hit) {
+          const hd = new Headers(hit.headers);
+          hd.set('x-ez-cache', 'HIT');
+          return new Response(hit.body, { status: hit.status, headers: hd });
+        }
+      }
+    } catch (e) { /* cache API unavailable */ }
+  }
+
+  let out = res;
+  if ((isHtml || isJs) && res.status === 200) {
+    try {
+      const txt = await res.text();
+      const patched = isHtml ? ezRewriteHtml(txt, origin) : ezRewriteJs(txt, origin);
+      const hdrs = new Headers();
+      res.headers.forEach((v, k) => {
+        const lk = k.toLowerCase();
+        if (lk !== 'content-length' && lk !== 'content-encoding' && lk !== 'transfer-encoding') hdrs.set(k, v);
+      });
+      hdrs.set('Access-Control-Allow-Origin', '*');
+      if (patched !== txt) hdrs.set('x-ez-rewritten', isHtml ? 'html' : 'js');
+      out = new Response(patched, { status: res.status, statusText: res.statusText, headers: hdrs });
+      if (cacheable && typeof caches !== 'undefined' && caches.default) {
+        try {
+          const put = caches.default.put(url.href, out.clone()).catch(() => {});
+          if (EZ_CTX && EZ_CTX.waitUntil) { try { EZ_CTX.waitUntil(put); } catch (eW) {} }
+          else void put;
+        } catch (e) { /* ignore */ }
+      }
+    } catch (e) { /* body unreadable — serve as-is */ }
+  } else {
+    out = ezRebuild(res, {
+      'Cache-Control': cacheable ? 'public, max-age=3600' : (res.headers.get('cache-control') || 'no-store'),
+    });
+    if (out.headers.get('content-type') === null) out.headers.set('Content-Type', 'application/octet-stream');
+    if (cacheable && typeof caches !== 'undefined' && caches.default) {
+      try {
+        const put = caches.default.put(url.href, out.clone()).catch(() => {});
+        if (EZ_CTX && EZ_CTX.waitUntil) { try { EZ_CTX.waitUntil(put); } catch (eW) {} }
+        else void put;
+      } catch (e) { /* ignore */ }
+    }
+  }
+  if (isHtml && out.headers.get('cache-control') !== 'no-store') {
+    out.headers.set('Cache-Control', 'no-store'); /* pages always fresh */
+  }
+  return out;
+}
+
+/* ---- v1.5: /__ezc/* — ezconv CONVERTER API for the in-app -------- *
+ * downloader (the app's own Download panel). Reverse-engineered flow:
+ *   1) POST api.ezsrv.net/api/attest {"token":""}        → JWT (~15min)
+ *   2) POST api.ezsrv.net/api/convert
+ *        {url, format, quality, supporterToken:null,
+ *         captchaToken:<the JWT>, trim:null}             → {jobId}
+ *   3) GET  api.ezsrv.net/api/convert/status?jobId=…     → percent,
+ *      phase, title, downloadUrl (dl2.ezsrv.net/download?sig=JWT)
+ *   4) GET  downloadUrl                                  → the file
+ * The worker wraps steps 1-3 so the browser ONLY ever calls:
+ *   GET /__ezc/convert?url=<yt link>&format=mp3&quality=128
+ *   GET /__ezc/status?jobId=…      (downloadUrl → /__ezdl/… rewritten)
+ * Step 4 streams through the existing /__ezdl allowlisted proxy with
+ * Range support. This is the "no direct website calls, everything
+ * through the worker" download path the user asked for. */
+const EZC_HEADERS = {
+  'Content-Type': 'application/json',
+  'Origin': EZ_SITE,
+  'Referer': EZ_SITE + '/',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+};
+const EZC_FORMATS = new Set(['mp3', 'm4a', 'wav', 'flac', 'mp4', 'mkv', 'mov', 'webm']);
+let EZC_JWT = null; /* module-scope { token, expiresAt } cache */
+
+async function ezcAttest(force) {
+  if (!force && EZC_JWT && EZC_JWT.expiresAt > Date.now() + 30000) return EZC_JWT.token;
+  const r = await fetchTimeout(EZ_API + '/api/attest', {
+    method: 'POST', headers: EZC_HEADERS, body: JSON.stringify({ token: '' }),
+  }, 10000);
+  const j = await r.json().catch(() => ({}));
+  if (j && j.token && j.expiresAt) { EZC_JWT = j; return j.token; }
+  if (j && j.error === 'turnstile_required') { const e = new Error('turnstile_required'); e.turnstile = true; throw e; }
+  throw new Error('attest failed (http ' + r.status + ')');
+}
+
+/* decode a sig JWT's payload (for the title + file extension) */
+function ezcJwtPayload(sig) {
+  try {
+    const parts = String(sig).split('.');
+    if (parts.length < 2) return null;
+    let b = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    while (b.length % 4) b += '=';
+    return JSON.parse(atob(b));
+  } catch (e) { return null; }
+}
+
+async function ezcApi(url, request) {
+  const path = url.pathname;
+  try {
+    if (path === '/__ezc/convert') {
+      const vurl = (url.searchParams.get('url') || '').trim();
+      const format = (url.searchParams.get('format') || 'mp3').toLowerCase();
+      const quality = parseInt(url.searchParams.get('quality') || '0', 10) || 0;
+      if (!/^https?:\/\/(www\.|m\.|music\.)?(youtube\.com|youtu\.be)\//i.test(vurl) && !/^https?:\/\/(www\.)?youtu\.be\//i.test(vurl)) {
+        return json({ error: 'invalid url — only YouTube links' }, { status: 400 });
+      }
+      if (!EZC_FORMATS.has(format)) return json({ error: 'invalid format' }, { status: 400 });
+      const post = tok => fetchTimeout(EZ_API + '/api/convert', {
+        method: 'POST', headers: EZC_HEADERS, body: JSON.stringify({ url: vurl, format, quality, supporterToken: null, captchaToken: tok, trim: null }),
+      }, 20000);
+      let token;
+      try { token = await ezcAttest(); } catch (e) {
+        if (e.turnstile) return json({ error: 'turnstile_required', turnstile: true }, { status: 401 });
+        throw e;
+      }
+      let r = await post(token);
+      let j = await r.json().catch(() => ({}));
+      /* one automatic retry with a FRESH attest — the cached JWT may
+         have been revoked/rotated server-side */
+      if (r.status === 401 || (j && (j.error === 'attest_required' || j.error === 'invalid_token'))) {
+        try {
+          token = await ezcAttest(true);
+          r = await post(token);
+          j = await r.json().catch(() => ({}));
+        } catch (e2) {
+          if (e2.turnstile) return json({ error: 'turnstile_required', turnstile: true }, { status: 401 });
+          return json({ error: 'attest retry failed: ' + (e2 && e2.message) }, { status: 502 });
+        }
+      }
+      if (j && j.jobId) return json({ jobId: j.jobId, status: j.status || 'processing', format, quality });
+      const isTurnstile = j && (j.error === 'turnstile_required' || j.error === 'captcha_required');
+      return json({ error: (j && j.error) || ('convert failed (http ' + r.status + ')'), turnstile: isTurnstile }, { status: isTurnstile ? 401 : 502 });
+    }
+
+    if (path === '/__ezc/status') {
+      const jobId = (url.searchParams.get('jobId') || '').trim();
+      if (!jobId) return json({ error: 'missing jobId' }, { status: 400 });
+      const r = await fetchTimeout(EZ_API + '/api/convert/status?jobId=' + encodeURIComponent(jobId), {
+        headers: EZC_HEADERS,
+      }, 12000);
+      const j = await r.json().catch(() => ({}));
+      const out = {
+        status: (j && j.status) || 'unknown',
+        percent: (j && typeof j.percent === 'number') ? j.percent : 0,
+        phase: (j && j.phase) || '',
+        title: (j && j.title) || '',
+        deliveredHeight: (j && j.deliveredHeight) || null,
+        error: (j && j.error) || '',
+        downloadUrl: '',
+        filename: '',
+      };
+      if (j && j.downloadUrl) {
+        try {
+          const du = new URL(j.downloadUrl);
+          if (EZ_DL_HOST_RE.test(du.host)) {
+            out.downloadUrl = EZ_DL_PREFIX + '/' + du.host + du.pathname + du.search;
+            /* filename: from the sig JWT (title + file path with ext) */
+            const sig = du.searchParams.get('sig');
+            const pl = sig ? ezcJwtPayload(sig) : null;
+            const ext = (pl && pl.file && /\.([a-z0-9]{2,4})$/i.exec(pl.file)) ? RegExp.$1.toLowerCase() : '';
+            const name = sanitizeFilename((pl && pl.title) || out.title || 'download') + (ext ? '.' + ext : '');
+            out.filename = name;
+          } else {
+            out.error = 'download host not allowlisted: ' + du.host;
+          }
+        } catch (e) { /* keep downloadUrl empty */ }
+      }
+      return json(out);
+    }
+
+    return json({ error: 'unknown /__ezc route' }, { status: 404 });
+  } catch (e) {
+    return json({ error: String(e && e.message || e) }, { status: 500 });
+  }
+}
+
+/* ---- API tier: /__ezapi/<path> → https://api.ezsrv.net/<path> ----- *
+ * POST attest/convert, GET status — body passthrough, JSON download
+ * URLs rewritten to the /__ezdl relay, CORS wide open. */
+async function ezApiProxy(url, request) {
+  const origin = url.origin;
+  const sub = url.pathname.slice(EZ_API_PREFIX.length) || '/'; /* "/api/convert" */
+  const target = EZ_API + sub + (url.search || '');
+
+  const res = await fetch(target, ezUpstreamInit(url, request, EZ_SITE, EZ_SITE + '/'));
+  const ct = (res.headers.get('content-type') || '').toLowerCase();
+
+  if (res.status === 200 && ct.includes('application/json')) {
+    try {
+      const txt = await res.text();
+      const patched = ezRewriteJson(txt, origin);
+      const hdrs = new Headers();
+      res.headers.forEach((v, k) => {
+        const lk = k.toLowerCase();
+        if (lk !== 'content-length' && lk !== 'content-encoding' && lk !== 'transfer-encoding') hdrs.set(k, v);
+      });
+      hdrs.set('Content-Type', 'application/json; charset=utf-8');
+      hdrs.set('Access-Control-Allow-Origin', '*');
+      hdrs.set('Cache-Control', 'no-store');
+      if (patched !== txt) hdrs.set('x-ez-rewritten', 'json');
+      return new Response(patched, { status: res.status, statusText: res.statusText, headers: hdrs });
+    } catch (e) { /* fall through to passthrough */ }
+  }
+  return ezRebuild(res, { 'Cache-Control': 'no-store' });
+}
+
+/* ---- download tier: /__ezdl/<host>/<path> ------------------------- *
+ * Streams converted MP3/MP4 files from dl*.ezsrv.net through the
+ * worker: Range passthrough (seekable), Content-Disposition preserved
+ * (the real filename), CORS open so the page can trigger the save.
+ * Only *.ezsrv.net hosts are allowed — this is not an open proxy. */
+async function ezDlProxy(url, request) {
+  const rest = url.pathname.slice(EZ_DL_PREFIX.length + 1); /* "dl2.ezsrv.net/download" */
+  const slash = rest.indexOf('/');
+  if (slash < 1) return json({ error: 'expected /__ezdl/<host>/<path>' }, { status: 400 });
+  const host = rest.slice(0, slash).toLowerCase();
+  const pathPart = rest.slice(slash);
+  if (!EZ_DL_HOST_RE.test(host)) {
+    return json({ error: 'only ezsrv.net download hosts are proxied' }, { status: 403 });
+  }
+  const target = 'https://' + host + pathPart + (url.search || '');
+
+  const headers = new Headers();
+  for (const name of ['range', 'accept', 'accept-language']) {
+    const v = request.headers.get(name);
+    if (v) headers.set(name, v);
+  }
+  headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+  headers.set('Referer', EZ_SITE + '/');
+
+  const res = await fetch(target, { headers, redirect: 'follow', credentials: 'omit' });
+  const out = new Headers();
+  res.headers.forEach((v, k) => {
+    const lk = k.toLowerCase();
+    if (lk !== 'content-encoding' && lk !== 'transfer-encoding' &&
+        lk !== 'set-cookie' && lk !== 'strict-transport-security' && lk !== 'report-to' && lk !== 'nel') {
+      out.set(k, v);
+    }
+  });
+  /* v1.5: KEEP upstream Content-Length when the body isn't re-encoded —
+     the app's in-app save uses it for the byte-level progress bar.
+     (204/304 and Range-less streams without a length are fine: the
+     browser simply uses chunked encoding and the app shows an
+     indeterminate bar.) */
+  const upstreamLen = res.headers.get('content-length');
+  if (upstreamLen && res.status !== 204 && res.status !== 304) {
+    out.set('Content-Length', upstreamLen);
+  }
+  /* keep the download an attachment no matter what upstream says */
+  if (!out.get('Content-Disposition')) {
+    const fn = decodeURIComponent((pathPart.split('/').pop() || 'download').split('?')[0]).slice(0, 120) || 'download';
+    out.set('Content-Disposition', 'attachment; filename="' + fn.replace(/[\r\n"\\/]/g, '_') + '"');
+  }
+  out.set('Access-Control-Allow-Origin', '*');
+  out.set('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length, Content-Type');
+  out.set('Cache-Control', 'no-store');
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers: out });
 }
