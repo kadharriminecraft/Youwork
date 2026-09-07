@@ -1,5 +1,5 @@
 /* =====================================================================
-   YT-ONLY WORKER v1.6 — a dedicated Cloudflare Worker purpose-built for
+   YT-ONLY WORKER v1.7 — a dedicated Cloudflare Worker purpose-built for
    the YT-Only app (the stripped-down YouTube-only player).
 
    Deploy on YOUR Cloudflare account (free tier is fine):
@@ -9,18 +9,22 @@
      4. In the app: Settings (gear) → paste the URL → Save → Test connection
 
    What this worker does:
-     - /__yt/health           → version probe ("yt-only-ok/1.6")
+     - /__yt/health           → version probe ("yt-only-ok/1.7")
      - /__yt/search?q=QUERY   → JSON { videos:[...], channels:[...] }
        v1.5: three sources RACE IN PARALLEL (innertube ANDROID_VR API +
        HTML scrape + Piped) — fast AND throttle-proof.
      - /__yt/video?id=VID     → JSON { id,title,description,views,date,channel,related }
        v1.5: watch scrape + innertube player + Piped race in parallel.
+       v1.7: + innertube SEARCH-BY-ID rescue (works when the watch page
+       is throttled or the player is login-gated).
      - /__yt/home             → JSON { videos:[...] } (popular feed)
      - /__yt/channel?id=|handle= → JSON { header, videos:[...] }
        v1.6: ABSOLUTE-LATEST channel videos — innertube /browse (API,
        newest-first) + the YouTube RSS feed (exact timestamps) raced in
        parallel with the old scrape + Piped tiers; merged, deduped and
        epoch-sorted newest-first. Every video carries `published` (ms).
+       v1.7: + the channel's UPLOADS PLAYLIST (UU…) tier — the most
+       title-reliable source (fixes blank titles, e.g. LTT).
      - /__yt/dl?id=VID&type=audio|video → streams the file through this
        worker (Content-Disposition: attachment) so the browser downloads
        it directly from YOUR worker — no external site needed.
@@ -44,7 +48,23 @@
        land back inside the proxy. The worker root IS the converter:
        just open https://YOUR.WORKER/ and ezconv appears, unblocked.
 
-   WHAT CHANGED IN v1.6 (absolute-latest channel videos):
+   WHAT CHANGED IN v1.7 (blank-title channels + metadata rescue):
+     1. CHANNELS — a 5th parallel tier: the channel's UPLOADS PLAYLIST
+        (UU…, innertube /browse with VL prefix). Every channel maintains
+        this playlist automatically and it is newest-first with items
+        that ALWAYS carry title + duration + channel — so a channel page
+        can no longer come back with blank-titled cards (seen on Linus
+        Tech Tips) even when the other tiers answer thin. The browse
+        walk also accepts videoRenderer / gridVideoRenderer shapes now,
+        and RSS titles are HTML-entity-decoded (&amp; → &).
+     2. VIDEO METADATA — new FIRST rescue tier: innertube SEARCH BY ID
+        (API call, exact-id match). It answers even when /watch is
+        429-throttled AND when the player call is LOGIN_REQUIRED
+        (music/age-gated videos from datacenter IPs) — covering the
+        remaining "some metadata don't load" cases with title, channel,
+        views, date and even a related list.
+
+  WHAT CHANGED IN v1.6 (absolute-latest channel videos):
      1. CHANNEL VIDEO FRESHNESS — the old channel endpoint leaned on the
         HTML scrape (often shelled/429'd to datacenter IPs) and Piped
         relatedStreams (stale or popular-sorted on many public
@@ -173,7 +193,7 @@
    ===================================================================== */
 
 /* ----- version + config -------------------------------------------- */
-const VERSION = '1.6';
+const VERSION = '1.7';
 const HEALTH_TAG = 'yt-only-ok/' + VERSION;
 const YT_HOME = 'https://www.youtube.com';
 
@@ -420,8 +440,19 @@ async function handleRequest(request) {
           throw new Error('piped empty');
         },
       ], { settleMs: 2000, minRich: 130, rank });
-      /* rescue tiers — search-by-ID scrape (works when /watch is 429'd
-         but /results isn't), then oEmbed (nearly always up) */
+      /* rescue tiers (v1.7 order = cheapest + throttle-proof first):
+       *   1. innertube SEARCH BY ID — an API call; answers even when
+       *      /watch is 429'd or the player is LOGIN_REQUIRED (music /
+       *      age gates from datacenter IPs) — the "some metadata still
+       *      don't load" fix
+       *   2. search-by-ID HTML scrape (works when /watch is 429'd but
+       *      /results isn't)
+       *   3. oEmbed (nearly always up, sparse) */
+      if (!data || !data.title) {
+        try {
+          data = await innertubeSearchVideoMeta(id, 7000);
+        } catch (e) { /* keep going */ }
+      }
       if (!data || !data.title) {
         try {
           const html = await fetchUpstream(YT_HOME + '/results?search_query=' + encodeURIComponent(id) + '&hl=en&gl=US');
@@ -472,7 +503,7 @@ async function handleRequest(request) {
 
     /* channel page -------------------------------------------------- *
      * v1.6: channels now answer with the ABSOLUTE LATEST uploads,
-     * newest-first. Four tiers run IN PARALLEL and merge:
+     * newest-first. Five tiers run IN PARALLEL and merge:
      *   1. innertube /browse (ANDROID_VR, videos tab, sort=newest) —
      *      the throttle-proof API tier that made v1.5 search fast;
      *      ~30 newest videos with views/dates/durations.
@@ -482,6 +513,10 @@ async function handleRequest(request) {
      *   3. Piped /channel/{id} → header (name/avatar/desc/subs) and
      *      videos when the instance still returns them.
      *   4. youtube.com scrape → header extras (banner/handle) + videos.
+     *   5. v1.7: the channel's UPLOADS PLAYLIST (UU… via innertube
+     *      /browse) — newest-first, and the one tier whose items ALWAYS
+     *      carry titles + durations (fixes channels whose cards showed
+     *      up with blank titles when other tiers came back thin).
      * Videos are deduped by id, given a `published` epoch (RSS exact,
      * relative texts parsed otherwise), and sorted NEWEST-FIRST.
      * @handle requests resolve to a UC id through Piped's channel search
@@ -497,16 +532,42 @@ async function handleRequest(request) {
 
       let resolvedId = idParam; /* may be filled in by handle resolution */
 
-      /* -- resolve @handle → UC id (Piped first, then externalId) --- */
+      /* -- resolve @handle → UC id (v1.7: three resolvers in PARALLEL,
+            authoritative-first). Piped's NAME search can return same-
+            named squatter channels (searching "@mkbhd" once resolved
+            to a 3-video channel literally named "MKBHD" instead of
+            Marques Brownlee's 19M-sub channel), so:
+              1. innertube SEARCH for the handle — the channel chip
+                 whose OWN canonicalBaseUrl equals /@handle is the
+                 handle's true owner (API call, throttle-proof);
+              2. the @handle page's "externalId" (authoritative when
+                 the page isn't shelled/429'd);
+              3. Piped handle search (last resort).
+            All three run at once (capped ~4.5s); preference order is
+            enforced by the || chain, so the answer stays fast AND
+            correct. --- */
       if (!resolvedId && handleParam) {
-        try { resolvedId = await pipedResolveHandle(handleParam); } catch (e) { /* next */ }
-        if (!resolvedId) {
-          try {
-            const html = await fetchUpstream(YT_HOME + '/' + (handleParam.startsWith('@') ? handleParam : '@' + handleParam) + '?hl=en', 6000);
-            const m = /"externalId":"(UC[A-Za-z0-9_-]{18,30})"/.exec(html || '');
-            if (m) resolvedId = m[1];
-          } catch (e) { /* scrape fallback below may still work */ }
-        }
+        const want = handleParam.startsWith('@') ? handleParam : '@' + handleParam;
+        const cap = (p) => Promise.race([
+          p.then(v => v || null, () => null),
+          new Promise(res => setTimeout(() => res(null), 4500)),
+        ]);
+        const chipIdP = (async () => {
+          const j = await innertubeSearchRaw({ context: VR_CONTEXT, query: want }, 6000);
+          const parsed = innertubeSearchParse(j);
+          const exact = parsed.channels.find(c => c.handle === want);
+          if (exact && exact.id) return exact.id;
+          throw new Error('no exact-handle chip');
+        })();
+        const extIdP = (async () => {
+          const html = await fetchUpstream(YT_HOME + '/' + want + '?hl=en', 6000);
+          const m = /"externalId":"(UC[A-Za-z0-9_-]{18,30})"/.exec(html || '');
+          if (m) return m[1];
+          throw new Error('no externalId');
+        })();
+        const pipedIdP = pipedResolveHandle(handleParam).catch(() => null);
+        const [chipId, extId, pipedId] = await Promise.all([cap(chipIdP), cap(extIdP), cap(pipedIdP)]);
+        resolvedId = chipId || extId || pipedId || '';
       }
 
       /* -- run ALL tiers in parallel; failures return null ---------- */
@@ -520,6 +581,11 @@ async function handleRequest(request) {
         jobs.push(
           rssChannel(resolvedId, 5000)
             .then(v => ({ kind: 'rss', videos: v }))
+            .catch(() => null)
+        );
+        jobs.push(
+          innertubeUploadsPlaylist(resolvedId, 7000)
+            .then(v => ({ kind: 'uploads', videos: v }))
             .catch(() => null)
         );
         jobs.push(
@@ -555,6 +621,7 @@ async function handleRequest(request) {
       const scrapeS = byKind('scrape');
       const browseS = byKind('browse');
       const rssS = byKind('rss');
+      const uploadsS = byKind('uploads');
 
       /* -- merge headers: scrape extras + Piped freshness + browse gap
             filler; first non-empty value per key wins by layer order -- */
@@ -591,6 +658,11 @@ async function handleRequest(request) {
       pushAll(scrapeS && scrapeS.videos);
       pushAll(pipedS && pipedS.videos);
       pushAll(rssS && rssS.videos);
+      /* v1.7: uploads playlist LAST — it mainly guarantees a title +
+         duration for every card and adds any video the other tiers
+         missed; its own items are already newest-first, and undated
+         ones sink to the bottom of the epoch sort (they ARE older) */
+      pushAll(uploadsS && uploadsS.videos);
       /* exact RSS timestamps beat the parsed-relative approximations */
       if (rssS) {
         for (const v of rssS.videos) {
@@ -621,7 +693,7 @@ async function handleRequest(request) {
         cacheSet(cacheKey, out, 300000);
         return json(out);
       }
-      return json({ error: 'channel unavailable — all four tiers (browse / RSS / scrape / Piped) failed. Try again in a moment.' }, { status: 502 });
+      return json({ error: 'channel unavailable — all five tiers (browse / RSS / uploads / scrape / Piped) failed. Try again in a moment.' }, { status: 502 });
     }
 
     /* image proxy — transparent passthrough for thumbnails ---------- */
@@ -1566,24 +1638,30 @@ function parseRelDate(s) {
   return unitMs ? (Date.now() - n * unitMs) : 0;
 }
 
-/* compactVideoRenderer (innertube browse) → app video shape. */
+/* compactVideoRenderer (innertube browse) → app video shape.
+   v1.7: also accepts videoRenderer / gridVideoRenderer — the browse
+   response sometimes wraps the videos tab in a rich grid instead of
+   the compact list, and a title-only item from ANY shape is better
+   than a missing card. */
 function compactToVideo(c) {
   if (!c || !c.videoId) return null;
   let chId = '';
   try {
-    const run = c.shortBylineText && c.shortBylineText.runs && c.shortBylineText.runs[0];
-    const be = run && run.navigationEndpoint && run.navigationEndpoint.browseEndpoint;
-    chId = (be && be.browseId) || '';
+    const run = (c.shortBylineText || c.longBylineText || c.ownerText || { runs: [] }).runs;
+    const r0 = run && run[0];
+    const be = r0 && r0.navigationEndpoint && r0.navigationEndpoint.browseEndpoint;
+    chId = (be && be.browseId) || (typeof c.channelId === 'string' ? c.channelId : '') || '';
   } catch (e) {}
   const dateTxt = textOf(c.publishedTimeText) || '';
+  const byline = c.shortBylineText || c.longBylineText || c.ownerText;
   return {
     id: c.videoId,
     title: textOf(c.title) || '',
     thumb: 'https://i.ytimg.com/vi/' + c.videoId + '/hqdefault.jpg',
-    channel: textOf(c.shortBylineText) || '',
+    channel: textOf(byline) || '',
     channelId: chId,
     duration: textOf(c.lengthText) || '',
-    views: textOf(c.viewCountText) || '',
+    views: textOf(c.viewCountText) || textOf(c.shortViewCountText) || '',
     date: dateTxt,
     published: parseRelDate(dateTxt),
   };
@@ -1623,14 +1701,17 @@ async function innertubeBrowseChannel(chId, ms) {
     if (hm) header.handle = hm[1];
   } catch (e) { /* header is best-effort */ }
 
-  /* videos: walk the whole tree for compactVideoRenderer items */
+  /* videos: walk the whole tree for video items — v1.7 accepts
+     compactVideoRenderer, videoRenderer AND gridVideoRenderer (the
+     VR client swaps shapes between channel layouts) */
   const videos = [];
   const seen = new Set();
   const walk = (n) => {
     if (!n || typeof n !== 'object' || videos.length >= 40) return;
     if (Array.isArray(n)) { for (const x of n) walk(x); return; }
-    if (n.compactVideoRenderer) {
-      const v = compactToVideo(n.compactVideoRenderer);
+    const item = n.compactVideoRenderer || n.videoRenderer || n.gridVideoRenderer;
+    if (item && item.videoId) {
+      const v = compactToVideo(item);
       if (v && v.id && !seen.has(v.id)) { seen.add(v.id); videos.push(v); }
     }
     for (const k of Object.keys(n)) walk(n[k]);
@@ -1638,6 +1719,71 @@ async function innertubeBrowseChannel(chId, ms) {
   walk(j.contents);
   if (!videos.length && !header.title) throw new Error('browse empty');
   return { header, videos };
+}
+
+/* v1.7 — the channel's UPLOADS PLAYLIST via innertube /browse.
+   Every channel auto-maintains a UU<id> playlist of ALL its uploads,
+   newest-first; asking for it with the ANDROID_VR client returns
+   playlistVideoRenderer items that ALWAYS carry the title, duration
+   and channel attribution — the most title-reliable source there is
+   (fixes channels whose cards showed up with BLANK titles when the
+   other tiers answered thin). No dates/views here — those merge in
+   from browse/RSS/scrape. */
+async function innertubeUploadsPlaylist(chId, ms) {
+  const playlistId = 'UU' + String(chId).replace(/^UC/, '');
+  if (playlistId.length < 4) throw new Error('bad channel id');
+  const r = await fetchTimeout('https://www.youtube.com/youtubei/v1/browse?prettyPrint=false', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'User-Agent': VR_UA },
+    body: JSON.stringify({ context: VR_CONTEXT, browseId: 'VL' + playlistId }),
+  }, ms || 7000);
+  if (!r.ok) throw new Error('uploads http ' + r.status);
+  const j = await r.json();
+  const videos = [];
+  const seen = new Set();
+  const walk = (n) => {
+    if (!n || typeof n !== 'object' || videos.length >= 60) return;
+    if (Array.isArray(n)) { for (const x of n) walk(x); return; }
+    if (n.playlistVideoRenderer && n.playlistVideoRenderer.videoId) {
+      const p = n.playlistVideoRenderer;
+      const id = p.videoId;
+      if (!seen.has(id)) {
+        seen.add(id);
+        let cid = chId;
+        try {
+          const run = p.shortBylineText && p.shortBylineText.runs && p.shortBylineText.runs[0];
+          const be = run && run.navigationEndpoint && run.navigationEndpoint.browseEndpoint;
+          if (be && be.browseId) cid = be.browseId;
+        } catch (e) {}
+        videos.push({
+          id,
+          title: textOf(p.title) || '',
+          thumb: 'https://i.ytimg.com/vi/' + id + '/hqdefault.jpg',
+          channel: textOf(p.shortBylineText) || '',
+          channelId: cid,
+          duration: textOf(p.lengthText) || (p.lengthSeconds ? fmtDuration(parseInt(p.lengthSeconds, 10) || 0) : ''),
+          views: '',
+          date: '',
+          published: 0, /* no dates in playlists — RSS/browse supply them */
+        });
+      }
+    }
+    for (const k of Object.keys(n)) walk(n[k]);
+  };
+  walk(j.contents);
+  if (!videos.length) throw new Error('uploads empty');
+  return videos;
+}
+
+/* v1.7: RSS/XML titles carry HTML entities (&amp; &#39; &quot;) — a
+   literal "&amp;" in a video title looks broken on a card. Decode
+   the handful YouTube actually emits (named + numeric). */
+function xmlDecode(s) {
+  return String(s || '')
+    .replace(/&#x([0-9a-f]+);/gi, (mm, h) => { try { return String.fromCodePoint(parseInt(h, 16)); } catch (e) { return mm; } })
+    .replace(/&#(\d+);/g, (mm, d) => { try { return String.fromCodePoint(parseInt(d, 10)); } catch (e) { return mm; } })
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&#0?39;/g, "'")
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
 }
 
 /* YouTube channel RSS feed — the 15 ABSOLUTE LATEST uploads with EXACT
@@ -1678,9 +1824,9 @@ async function rssChannel(chId, ms) {
     }
     videos.push({
       id,
-      title: pick('title'),
+      title: xmlDecode(pick('title')),
       thumb: 'https://i.ytimg.com/vi/' + id + '/hqdefault.jpg',
-      channel: nameM ? nameM[1] : '',
+      channel: nameM ? xmlDecode(nameM[1]) : '',
       channelId: chId,
       duration: '',
       views: viewsM ? parseInt(viewsM[1], 10).toLocaleString('en-US') + ' views' : '',
@@ -1785,12 +1931,21 @@ function innertubeSearchParse(j) {
         const cthumbs = (r.thumbnail && r.thumbnail.thumbnails) || [];
         let avatar = cthumbs.length ? cthumbs[cthumbs.length - 1].url : '';
         if (avatar && avatar.indexOf('//') === 0) avatar = 'https:' + avatar;
+        /* v1.7: capture the channel's OWN handle (@name) from the chip's
+           browseEndpoint — lets handle resolution match EXACTLY (Piped's
+           name-based search returns same-NAMED squatter channels) */
+        let chHandle = '';
+        try {
+          const cbe = r.navigationEndpoint && r.navigationEndpoint.browseEndpoint;
+          if (cbe && cbe.canonicalBaseUrl) chHandle = String(cbe.canonicalBaseUrl).replace(/^\//, '');
+        } catch (e) {}
         channels.push({
           id: cid,
           name: textOf(r.title) || textOf(r.displayName),
           avatar,
           subs: textOf(r.subscriberCountText),
           url: 'https://www.youtube.com/channel/' + cid,
+          handle: chHandle,
         });
       }
     }
@@ -1834,6 +1989,37 @@ async function innertubeSearch(q) {
     } catch (e) { /* page 2 optional */ }
   }
   return { videos: out.videos, channels: out.channels };
+}
+
+/* v1.7 — metadata rescue: search FOR the video id. Searching a video's
+ * own 11-char id returns that exact video as the top result — an API
+ * call (ANDROID_VR), so it works even when the /watch HTML page is
+ * 429-throttled or the player call comes back LOGIN_REQUIRED (music /
+ * age gates). Only accepts an EXACT id match so the watch page can
+ * never show another video's metadata. Search results for an id are
+ * also decent "up next" candidates, so they double as related. */
+async function innertubeSearchVideoMeta(videoId, ms) {
+  const j = await innertubeSearchRaw({ context: VR_CONTEXT, query: videoId }, ms || 7000);
+  const parsed = innertubeSearchParse(j);
+  const v = parsed.videos.find(x => x.id === videoId);
+  if (!v || !v.title) throw new Error('search-by-id no exact match');
+  return {
+    id: v.id,
+    title: v.title,
+    description: '',
+    views: v.views || '',
+    date: v.date || '',
+    duration: v.duration || '',
+    thumb: v.thumb || ('https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg'),
+    channel: {
+      id: v.channelId || '',
+      name: v.channel || '',
+      avatar: '',
+      subs: '',
+      url: v.channelId ? 'https://www.youtube.com/channel/' + v.channelId : '',
+    },
+    related: parsed.videos.filter(x => x.id !== videoId).slice(0, 24),
+  };
 }
 
 /* Map a Piped /streams response onto the app's watch-page shape. */
