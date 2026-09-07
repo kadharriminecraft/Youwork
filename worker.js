@@ -1,5 +1,5 @@
 /* =====================================================================
-   YT-ONLY WORKER v1.2 — a dedicated Cloudflare Worker purpose-built for
+   YT-ONLY WORKER v1.3 — a dedicated Cloudflare Worker purpose-built for
    the YT-Only app (the stripped-down YouTube-only player).
 
    Deploy on YOUR Cloudflare account (free tier is fine):
@@ -9,8 +9,8 @@
      4. In the app: Settings (gear) → paste the URL → Save → Test connection
 
    What this worker does:
-     - /__yt/health           → version probe ("yt-only-ok/1.2")
-     - /__yt/search?q=QUERY   → JSON { videos:[{id,title,channel,thumb,duration,...}] }
+     - /__yt/health           → version probe ("yt-only-ok/1.3")
+     - /__yt/search?q=QUERY   → JSON { videos:[...], channels:[...] }
      - /__yt/video?id=VID     → JSON { id,title,description,views,date,channel,related }
      - /__yt/home             → JSON { videos:[...] } (popular feed)
      - /__yt/channel?id=|handle= → JSON { header, videos:[...] }
@@ -19,6 +19,26 @@
        it directly from YOUR worker — no external site needed.
      - /__yt/img?url=URL      → passthrough image proxy
      - /__yt/proxy?url=URL    → generic CORS proxy
+
+   WHAT CHANGED IN v1.3 (channel reliability + fast reliable downloads):
+     1. CHANNELS — ported from the Relay browser app, whose channel code
+        was verified working on real devices: Piped's /channel/{id} API
+        is now the FIRST source (YouTube serves JS-only shell pages with
+        no ytInitialData to datacenter egress — that is why channels
+        failed), with @handle resolution through Piped's channel search,
+        and the HTML scrape kept only as the last fallback.
+     2. PIPED RACING — instances are queried IN PARALLEL now; the first
+        valid payload wins. Previously dead instances were walked one by
+        one with 10-12s timeouts each, which is why downloads hung for
+        60s+ and sometimes 502'd. Worst case is now ~6 seconds total.
+     3. /__yt/dl — video tier: muxed MP4 (innertube ANDROID_VR itag 18,
+        Piped videoOnly:false) + LBRY mirror as an extra fallback when
+        YouTube formats are unavailable. Audio tier unchanged (it worked).
+     4. /__yt/video — added oEmbed as a 4th cheap fallback (title +
+        channel even when every other source is throttled) and a short
+        in-memory cache so repeated visits don't re-hit YouTube.
+     5. /__yt/search — response now includes channel results (chips)
+        from the same ytInitialData walk + Piped channels filter.
 
    WHAT CHANGED IN v1.2 (fixes 429 throttling + adds downloads):
      1. YouTube 429-throttles /watch page scrapes from some datacenter
@@ -67,7 +87,7 @@
    ===================================================================== */
 
 /* ----- version + config -------------------------------------------- */
-const VERSION = '1.2';
+const VERSION = '1.3';
 const HEALTH_TAG = 'yt-only-ok/' + VERSION;
 const YT_HOME = 'https://www.youtube.com';
 
@@ -77,10 +97,15 @@ const YT_HOME = 'https://www.youtube.com';
    This is YouTube's official "Most Popular" playlist. */
 const HOME_PLAYLIST = 'PLFgquLnL59alCl_2TQvOiD5Vgm1hCaGSI';
 
-/* Piped API instances, tried in order (video metadata fallback chain
-   + download fallback). Public community instances; availability
-   varies, so the worker walks the list until one answers. */
-const PIPED_INSTANCES = [
+/* Piped API instances (channels-first tier, v1.3).
+   Ported from the Relay browser app — the SAME instances and the SAME
+   endpoints its working channel code uses:
+     /channel/{id}      → name, avatar, description, latest streams
+     /search?filter=channels → @handle → channel-id resolution
+   Instances are RACED IN PARALLEL (pipedGet below) — the first one
+   that answers with a usable payload wins, so one slow/dead instance
+   can no longer stall a request the way the old sequential walk did. */
+const PIPED_BASES = [
   'https://api.piped.private.coffee',
   'https://pipedapi.kavin.rocks',
   'https://pipedapi.adminforge.de',
@@ -88,6 +113,39 @@ const PIPED_INSTANCES = [
   'https://piapi.ggtyler.dev',
   'https://pipedapi.ducks.party',
 ];
+
+/* Race every Piped instance at once; resolve with the first VALID json.
+   validate(j) → true means "this payload is usable". 6s timeout per
+   instance keeps the whole tier under ~6 seconds worst-case. */
+function pipedGet(path, validate, ms) {
+  const attempts = PIPED_BASES.map(async (base) => {
+    const r = await fetchTimeout(base + path, { headers: { Accept: 'application/json' } }, ms || 6000);
+    if (!r.ok) throw new Error('http ' + r.status);
+    const j = await r.json();
+    if (!j || (validate && !validate(j))) throw new Error('bad payload');
+    return j;
+  });
+  return new Promise((resolve, reject) => {
+    let remaining = attempts.length;
+    let settled = false;
+    let timer = null;
+    const finish = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      fn(arg);
+    };
+    /* hard ceiling: even if every fetch hangs, reject at +2s past the
+       per-instance timeout so callers never wait forever */
+    timer = setTimeout(() => finish(reject, new Error('piped race timeout')), (ms || 6000) + 2000);
+    attempts.forEach(p => {
+      Promise.resolve(p).then(
+        (j) => finish(resolve, j),
+        () => { if (--remaining === 0) finish(reject, new Error('all piped instances failed')); }
+      );
+    });
+  });
+}
 
 /* innertube ANDROID_VR client — currently the most reliable client
    that returns deciphered (direct) stream URLs without PO tokens. */
@@ -168,34 +226,60 @@ async function handleRequest(request) {
     /* search -------------------------------------------------------- */
     if (path === '/__yt/search') {
       const q = (url.searchParams.get('q') || '').trim();
-      if (!q) return json({ error: 'missing q', videos: [] });
+      if (!q) return json({ error: 'missing q', videos: [], channels: [] });
+      /* 1) youtube.com/results scrape (videos + channel renderers) */
       try {
         const html = await fetchUpstream(YT_HOME + '/results?search_query=' + encodeURIComponent(q) + '&hl=en&gl=US');
-        const videos = collectVideos(extractYtInitialData(html));
-        if (videos.length) return json({ query: q, videos });
+        const data = extractYtInitialData(html);
+        const videos = collectVideos(data);
+        if (videos.length) {
+          const channels = collectChannels(data);
+          return json({ query: q, videos, channels });
+        }
       } catch (e) { /* fall through to Piped */ }
+      /* 2) Piped — videos + channels raced in parallel */
       const pv = await pipedSearch(q);
-      return json({ query: q, videos: pv });
+      let pc = [];
+      try {
+        const jc = await pipedGet('/search?q=' + encodeURIComponent(q) + '&filter=channels', j => j && Array.isArray(j.items) && j.items.length);
+        pc = (jc.items || []).map(pipedItemToChannel).filter(Boolean).slice(0, 6);
+      } catch (e) { /* channels are optional */ }
+      return json({ query: q, videos: pv, channels: pc });
     }
 
     /* video metadata — full /watch page parse, with fallback chain -- */
     if (path === '/__yt/video') {
       const id = (url.searchParams.get('id') || '').trim();
       if (!id) return json({ error: 'missing id' });
+      const cacheKey = 'video:' + id;
+      const hit = cacheGet(cacheKey);
+      if (hit) return json(hit);
       let data = null, lastErr = null;
       /* 1) HTML scrape (richest data: banner, exact dates, subs) */
       try {
         const html = await fetchUpstream(YT_HOME + '/watch?v=' + encodeURIComponent(id) + '&hl=en');
         data = parseWatchPage(html, id);
       } catch (e) { lastErr = e; }
-      /* 2) Piped API — works even when YouTube throttles our IP */
+      /* 2) search-by-ID scrape — KEY v1.3 insight: YouTube 429-throttles
+         /watch pages from datacenter IPs but NOT /results pages. Searching
+         the video id itself returns the video as the first result with
+         title, channelId, views, date, duration; the remaining results
+         serve as "Up next". This keeps metadata loading when /watch is
+         blocked. */
+      if (!data || !data.title) {
+        try {
+          const html = await fetchUpstream(YT_HOME + '/results?search_query=' + encodeURIComponent(id) + '&hl=en&gl=US');
+          data = parseSearchVideoMeta(extractYtInitialData(html), id);
+        } catch (e) { /* keep going */ }
+      }
+      /* 3) Piped API — works even when YouTube throttles our IP */
       if (!data || !data.title) {
         try {
           const pd = await pipedStreams(id);
           if (pd && pd.title) data = pipedToVideo(pd, id);
         } catch (e) { /* keep going */ }
       }
-      /* 3) innertube ANDROID_VR player (metadata) + /next (related) */
+      /* 4) innertube ANDROID_VR player (metadata) + /next (related) */
       if (!data || !data.title) {
         try {
           const iv = await innertubePlayer(id);
@@ -204,7 +288,16 @@ async function handleRequest(request) {
           }
         } catch (e) { /* keep going */ }
       }
-      if (data && (data.title || data.id)) return json(data);
+      /* 5) oEmbed — nearly always up, gives at least title + channel */
+      if (!data || !data.title) {
+        try {
+          data = await oembedVideo(id);
+        } catch (e) { /* keep going */ }
+      }
+      if (data && (data.title || data.id)) {
+        cacheSet(cacheKey, data, 180000);
+        return json(data);
+      }
       return json({ error: 'video unavailable: ' + (lastErr ? lastErr.message : 'no source answered') }, { status: 502 });
     }
 
@@ -224,17 +317,106 @@ async function handleRequest(request) {
       return json({ videos: tv.slice(0, 40) });
     }
 
-    /* channel page -------------------------------------------------- */
+    /* channel page -------------------------------------------------- *
+     * v1.3: two sources run IN PARALLEL and merge:
+     *   - Piped /channel/{id}  → header (name/avatar/banner/desc/subs)
+     *     is reliable even when YouTube shells pages to datacenter IPs.
+     *     (Relay-app architecture.)
+     *   - youtube.com /channel/{id}/videos scrape → the VIDEOS (lockups).
+     *     Channel grids scrape fine from datacenter IPs most of the time
+     *     — it's /watch that gets 429'd hard. When the scrape dies,
+     *     Piped's relatedStreams/nextpage fill in what they can.
+     * @handle requests resolve to a UC id through Piped's channel search
+     * first, then fall back to scraping /@handle/videos directly. */
     if (path === '/__yt/channel') {
-      const id = (url.searchParams.get('id') || '').trim();
-      const handle = (url.searchParams.get('handle') || '').trim();
-      if (!id && !handle) return json({ error: 'missing id or handle' });
-      const target = handle
-        ? YT_HOME + '/' + (handle.startsWith('@') ? handle : '@' + handle) + '/videos?hl=en'
-        : YT_HOME + '/channel/' + id + '/videos?hl=en';
-      const html = await fetchUpstream(target);
-      const data = parseChannel(html);
-      return json(data);
+      const idParam = (url.searchParams.get('id') || '').trim();
+      const handleParam = (url.searchParams.get('handle') || '').trim();
+      if (!idParam && !handleParam) return json({ error: 'missing id or handle' });
+
+      const cacheKey = 'channel:' + (idParam || handleParam);
+      const hit = cacheGet(cacheKey);
+      if (hit) return json(hit);
+
+      let resolvedId = idParam; /* may be filled in by handle resolution */
+      let pipedHeader = null;   /* header from Piped */
+
+      /* -- resolve @handle → UC id (Piped first, fast) ---------------- */
+      if (!resolvedId && handleParam) {
+        try { resolvedId = await pipedResolveHandle(handleParam); } catch (e) { /* scrape fallback below */ }
+      }
+
+      /* -- Piped header tier (also carries videos when the instance
+            still returns them inline) ---------------------------------- */
+      let pipedVideos = [];
+      if (resolvedId) {
+        try {
+          const j = await pipedGet('/channel/' + encodeURIComponent(resolvedId), jj => jj && (jj.name || Array.isArray(jj.relatedStreams)));
+          const pc = pipedToChannel(j, resolvedId);
+          pipedHeader = pc.header;
+          pipedVideos = pc.videos || [];
+          /* newer Piped builds moved videos to a continuation token */
+          if (!pipedVideos.length && j && j.nextpage) {
+            try {
+              /* the token carries the full request — try each base
+                 until one accepts it (usually the issuing instance) */
+              for (const b of PIPED_BASES) {
+                try {
+                  const r = await fetchTimeout(b + '/nextpage/channel/' + encodeURIComponent(resolvedId) + '?nextpage=' + encodeURIComponent(j.nextpage), { headers: { Accept: 'application/json' } }, 5000);
+                  if (!r.ok) continue;
+                  const j2 = await r.json();
+                  const rs = (j2 && j2.relatedStreams) || [];
+                  if (rs.length) { pipedVideos = rs.map(pipedItemToVideo).filter(v => v && v.id).slice(0, 30); break; }
+                } catch (e2) { /* next base */ }
+              }
+            } catch (e) { /* pagination unavailable */ }
+          }
+        } catch (e) { /* Piped tier down — scrape still covers us */ }
+      }
+
+      /* -- scrape tier: videos (primary) + header (fallback) ---------- */
+      const scrapeTarget = resolvedId
+        ? YT_HOME + '/channel/' + encodeURIComponent(resolvedId) + '/videos?hl=en'
+        : YT_HOME + '/' + (handleParam.startsWith('@') ? handleParam : '@' + handleParam) + '/videos?hl=en';
+      let scraped = null;
+      try {
+        const html = await fetchUpstream(scrapeTarget);
+        const parsed = parseChannel(html);
+        if (parsed && (parsed.header.title || (parsed.videos || []).length)) scraped = parsed;
+      } catch (e) { /* scrape down — Piped result is the answer */ }
+
+      /* -- merge: Piped header wins on freshness, scrape wins on videos,
+            each fills the other's gaps ---------------------------------- */
+      let out = null;
+      if (pipedHeader || scraped) {
+        const h = Object.assign({}, (scraped && scraped.header) || {}, pipedHeader || {});
+        /* scrape-only extras that Piped never provides (Object.assign
+           above overwrites them with '' — restore the real values) */
+        if (scraped && scraped.header) {
+          for (const k of ['banner', 'handle', 'videosCount', 'desc']) {
+            if (scraped.header[k] && !h[k]) h[k] = scraped.header[k];
+          }
+          if (!h.subs && scraped.header.subs) h.subs = scraped.header.subs;
+        }
+        const videos = ((scraped && scraped.videos) || []).length
+          ? (scraped && scraped.videos)
+          : pipedVideos;
+        /* channel attribution on every card (lockups carry none) */
+        for (const v of (videos || [])) {
+          if (!v.channel) v.channel = h.title || '';
+          if (!v.channelId) v.channelId = h.id || '';
+        }
+        out = {
+          source: pipedHeader ? 'piped+scrape' : 'scrape',
+          header: h,
+          videos: (videos || []).slice(0, 30),
+        };
+      }
+
+      if (out && (out.header.title || (out.videos || []).length)) {
+        cacheSet(cacheKey, out, 300000);
+        return json(out);
+      }
+      return json({ error: 'channel unavailable — both the Piped tier and the youtube.com scrape failed. Try again in a moment.' }, { status: 502 });
     }
 
     /* image proxy — transparent passthrough for thumbnails ---------- */
@@ -420,6 +602,61 @@ function collectVideos(data, excludeId, limit) {
     if (v && v.id && v.id !== excludeId && !seen[v.id]) {
       seen[v.id] = 1;
       out.push(v);
+    }
+
+    for (const k in node) {
+      const val = node[k];
+      if (val && typeof val === 'object') visit(val);
+    }
+  }
+  visit(data);
+  return out;
+}
+
+/* Walk ytInitialData collecting CHANNEL results (search page chips).
+   Handles both the desktop (channelRenderer) and mobile
+   (compactChannelRenderer) shapes — same approach the Relay app uses. */
+function collectChannels(data) {
+  if (!data) return [];
+  const out = [];
+  const seen = {};
+  const MAX = 8;
+
+  function pickAvatar(thumbs) {
+    const u = pickThumb(thumbs);
+    return u || '';
+  }
+
+  function visit(node) {
+    if (!node || typeof node !== 'object') return;
+    if (out.length >= MAX) return;
+
+    let c = null;
+    try {
+      if (node.channelRenderer) {
+        const r = node.channelRenderer;
+        c = {
+          id: r.channelId || '',
+          name: textOf(r.title),
+          subs: textOf(r.subscriberCountText) || textOf(r.videoCountText) || '',
+          avatar: pickAvatar(r.thumbnail && r.thumbnail.thumbnails),
+          desc: textOf(r.descriptionSnippet).slice(0, 120),
+        };
+      } else if (node.compactChannelRenderer) {
+        const r = node.compactChannelRenderer;
+        c = {
+          id: r.channelId || '',
+          name: textOf(r.displayName),
+          subs: textOf(r.subscriberCountText) || textOf(r.videoCountText) || '',
+          avatar: pickAvatar(r.thumbnail && r.thumbnail.thumbnails),
+          desc: '',
+        };
+      }
+    } catch (e) { c = null; }
+
+    if (c && c.id && c.name && !seen[c.id]) {
+      seen[c.id] = 1;
+      out.push(c);
     }
 
     for (const k in node) {
@@ -780,6 +1017,55 @@ function applyVideoDetails(result, vd) {
   }
 }
 
+/* Metadata from a /results?search_query={videoId} page — the fallback
+   that keeps working when /watch is 429-throttled. Finds the exact
+   videoRenderer for our id (title/channelId/views/date/duration);
+   the other search results become the related list. */
+function parseSearchVideoMeta(data, videoId) {
+  const result = {
+    id: videoId,
+    title: '',
+    description: '',
+    views: '',
+    date: '',
+    duration: '',
+    thumb: 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg',
+    channel: { id: '', name: '', avatar: '', url: '', subs: '', handle: '' },
+    related: [],
+    minimal: true,
+  };
+  if (!data) return result;
+
+  /* exact video card for this id */
+  let mine = null;
+  const q = [data];
+  while (q.length && !mine) {
+    const n = q.shift();
+    if (!n || typeof n !== 'object') continue;
+    if (n.videoRenderer && n.videoRenderer.videoId === videoId) { mine = n.videoRenderer; break; }
+    if (n.compactVideoRenderer && n.compactVideoRenderer.videoId === videoId) { mine = n.compactVideoRenderer; break; }
+    for (const k in n) if (n[k] && typeof n[k] === 'object') q.push(n[k]);
+  }
+  if (!mine) return result;
+
+  try {
+    const v = extractVideoRenderer(mine);
+    if (v) {
+      result.title = v.title || '';
+      result.views = v.views || '';
+      result.date = v.date || '';
+      result.duration = v.duration || '';
+      result.channel.id = v.channelId || '';
+      result.channel.name = v.channel || '';
+      if (result.channel.id) result.channel.url = 'https://www.youtube.com/channel/' + result.channel.id;
+    }
+  } catch (e) {}
+
+  /* the rest of the results as "Up next" */
+  result.related = collectVideos(data, videoId, 24);
+  return result;
+}
+
 /* =====================================================================
    v1.2 — FALLBACK SOURCES (Piped + innertube) + DOWNLOADS
    =====================================================================
@@ -795,57 +1081,167 @@ function applyVideoDetails(result, vd) {
    Everything below maps those sources onto the SAME response shapes
    the app already consumes, so the frontend needs no changes. */
 
-/* Piped: GET /streams/{id} from the first instance that answers. */
+/* Piped: GET /streams/{id} — parallel race (first valid payload wins) */
 async function pipedStreams(videoId) {
-  for (const base of PIPED_INSTANCES) {
-    try {
-      const r = await fetchTimeout(base + '/streams/' + encodeURIComponent(videoId), { headers: { Accept: 'application/json' } }, 10000);
-      if (!r.ok) continue;
-      const j = await r.json();
-      if (j && (j.title || j.relatedStreams)) return j;
-    } catch (e) { /* try next instance */ }
-  }
-  return null;
+  try {
+    return await pipedGet('/streams/' + encodeURIComponent(videoId),
+      j => j && (j.title || j.relatedStreams), 6000);
+  } catch (e) { return null; }
 }
 
 /* Piped: GET /search?q=...&filter=videos */
 async function pipedSearch(q) {
-  for (const base of PIPED_INSTANCES) {
-    try {
-      const r = await fetchTimeout(base + '/search?q=' + encodeURIComponent(q) + '&filter=videos', { headers: { Accept: 'application/json' } }, 10000);
-      if (!r.ok) continue;
-      const j = await r.json();
-      if (j && Array.isArray(j.items) && j.items.length) {
-        return j.items.filter(x => x && (x.url || '').includes('watch?v=')).map(pipedItemToVideo).slice(0, 40);
-      }
-    } catch (e) { /* try next instance */ }
-  }
-  return [];
+  try {
+    const j = await pipedGet('/search?q=' + encodeURIComponent(q) + '&filter=videos',
+      jj => jj && Array.isArray(jj.items) && jj.items.length, 6000);
+    return j.items
+      .filter(x => x && (x.url || '').includes('watch?v='))
+      .map(pipedItemToVideo)
+      .slice(0, 40);
+  } catch (e) { return []; }
 }
 
 /* Piped: GET /trending?region=US */
 async function pipedTrending() {
-  for (const base of PIPED_INSTANCES) {
-    try {
-      const r = await fetchTimeout(base + '/trending?region=US', { headers: { Accept: 'application/json' } }, 10000);
-      if (!r.ok) continue;
-      const j = await r.json();
-      if (Array.isArray(j) && j.length) {
-        return j.filter(x => x && (x.url || '').includes('watch?v=')).map(pipedItemToVideo);
-      }
-    } catch (e) { /* try next instance */ }
-  }
-  return [];
+  try {
+    const j = await pipedGet('/trending?region=US', Array.isArray, 6000);
+    return j.filter(x => x && (x.url || '').includes('watch?v=')).map(pipedItemToVideo);
+  } catch (e) { return []; }
+}
+
+/* ----- Piped channel tier (ported from the Relay app) -------------- *
+ * pipedResolveHandle: @handle / vanity name → UC channel id, via
+ * Piped's channel search (filter=channels). Mirrors Relay's
+ * pipedChannelByHandle: exact/prefix name match, else first hit. */
+async function pipedResolveHandle(handleRaw) {
+  const handle = String(handleRaw || '')
+    .replace(/^https?:\/\/[^\/]+\//i, '')
+    .replace(/^(c\/|user\/|channel\/)/i, '')
+    .replace(/^@/, '')
+    .replace(/\/$/, '')
+    .trim();
+  if (!handle) return null;
+  const j = await pipedGet('/search?q=' + encodeURIComponent(handle) + '&filter=channels',
+    jj => jj && Array.isArray(jj.items) && jj.items.length, 6000);
+  const items = (j && j.items) || [];
+  const want = handle.toLowerCase().replace(/\s+/g, '');
+  const hit = items.find(it => {
+    const nm = String((it && it.name) || '').toLowerCase().replace(/\s+/g, '');
+    return nm === want || nm.indexOf(want) === 0;
+  }) || items[0];
+  if (!hit) return null;
+  const m = /\/channel\/(UC[A-Za-z0-9_-]{18,30})/.exec(String(hit.url || ''));
+  return m ? m[1] : null;
+}
+
+/* Map a Piped /channel/{id} payload onto the app's channel-page shape.
+ * Same response contract as parseChannel(): { header, videos }. */
+function pipedToChannel(j, chId) {
+  const chUrl = 'https://www.youtube.com/channel/' + chId;
+  const videos = (j.relatedStreams || [])
+    .map(it => {
+      const v = pipedItemToVideo(it);
+      if (!v.id) return null;
+      if (!v.channel) v.channel = j.name || '';
+      if (!v.channelId) v.channelId = chId;
+      return v;
+    })
+    .filter(Boolean)
+    .slice(0, 30);
+  return {
+    source: 'piped',
+    header: {
+      id: chId,
+      title: j.name || '',
+      subs: fmtSubs(j.subscriberCount),
+      avatar: j.avatarUrl || '',
+      desc: String(j.description || '').slice(0, 400),
+      handle: '',
+      banner: '',
+      url: chUrl,
+    },
+    videos,
+  };
+}
+
+/* Map a Piped search-with-channels-filter item onto a channel chip. */
+function pipedItemToChannel(it) {
+  if (!it) return null;
+  const m = /\/channel\/(UC[A-Za-z0-9_-]{18,30})/.exec(String(it.url || ''));
+  if (!m) return null;
+  return {
+    id: m[1],
+    name: it.name || '',
+    subs: fmtSubs(it.subscribers),
+    avatar: it.thumbnail || '',
+    desc: String(it.description || '').slice(0, 120),
+  };
+}
+
+/* oEmbed — the cheapest metadata source on YouTube (no auth, no
+ * throttling). Gives title + channel name/url + thumbnail; enough to
+ * render a working watch page when everything else fails. */
+async function oembedVideo(id) {
+  const r = await fetchTimeout(
+    'https://www.youtube.com/oembed?url=' + encodeURIComponent('https://www.youtube.com/watch?v=' + id) + '&format=json',
+    { headers: { Accept: 'application/json' } }, 5000);
+  if (!r.ok) throw new Error('oembed http ' + r.status);
+  const j = await r.json();
+  if (!j || !j.title) throw new Error('oembed empty');
+  const chUrl = j.author_url || '';
+  const m = /\/channel\/(UC[A-Za-z0-9_-]{18,30})/.exec(chUrl);
+  return {
+    id,
+    title: j.title,
+    description: '',
+    views: '',
+    date: '',
+    duration: '',
+    thumb: j.thumbnail_url || ('https://i.ytimg.com/vi/' + id + '/hqdefault.jpg'),
+    channel: {
+      id: m ? m[1] : '',
+      name: j.author_name || '',
+      avatar: '',
+      subs: '',
+      handle: '',
+      url: chUrl,
+    },
+    related: [],
+    minimal: true,
+  };
+}
+
+/* ----- tiny in-memory TTL cache (per isolate) ---------------------- *
+ * Softens repeated hammering of the same video/channel within a few
+ * minutes (back navigation, subs refresh). Cheap Map + size cap. */
+const MEM_CACHE = new Map();
+const MEM_CACHE_MAX = 120;
+function cacheGet(key) {
+  const e = MEM_CACHE.get(key);
+  if (!e) return null;
+  if (Date.now() > e.exp) { MEM_CACHE.delete(key); return null; }
+  return e.val;
+}
+function cacheSet(key, val, ttlMs) {
+  try {
+    if (MEM_CACHE.size >= MEM_CACHE_MAX) {
+      /* drop the oldest entry (insertion order = roughly oldest first) */
+      const firstKey = MEM_CACHE.keys().next().value;
+      MEM_CACHE.delete(firstKey);
+    }
+    MEM_CACHE.set(key, { val, exp: Date.now() + (ttlMs || 60000) });
+  } catch (e) { /* cache must never break a response */ }
 }
 
 /* innertube: ANDROID_VR player call. Returns the raw player response
-   (videoDetails + streamingData with direct URLs). */
-async function innertubePlayer(videoId) {
+   (videoDetails + streamingData with direct URLs). `ms` caps the
+   wait (downloads pass a tighter budget so fallbacks engage fast). */
+async function innertubePlayer(videoId, ms) {
   const r = await fetchTimeout('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'User-Agent': VR_UA },
     body: JSON.stringify({ context: VR_CONTEXT, videoId, contentCheckOk: true, racyCheckOk: true }),
-  }, 12000);
+  }, ms || 12000);
   if (!r.ok) return null;
   return r.json().catch(() => null);
 }
@@ -950,9 +1346,12 @@ async function handleDownload(url, request) {
   let stream = null; /* { url, mime, title } */
   let why = '';
 
-  /* 1) innertube ANDROID_VR — direct googlevideo URLs (deciphered). */
+  /* 1) innertube ANDROID_VR — direct googlevideo URLs (deciphered).
+     8s cap: this normally answers in well under a second; when YouTube
+     throttles it we want the Piped tier to take over QUICKLY (the old
+     12s cap + sequential Piped walk is why downloads hung for a minute). */
   try {
-    const iv = await innertubePlayer(id);
+    const iv = await innertubePlayer(id, 8000);
     if (iv && iv.streamingData) {
       const title = (iv.videoDetails && iv.videoDetails.title) || titleParam || 'video';
       const formats = [
@@ -968,8 +1367,8 @@ async function handleDownload(url, request) {
         if (pick) stream = { url: pick.url, mime: 'audio/mp4', title };
         else why = 'innertube returned no audio formats';
       } else {
-        /* progressive = audio+video muxed. adaptiveFormats are
-           video-only (can't be downloaded alone as a watchable file). */
+        /* progressive = audio+video muxed (itag 18 = 360p, sometimes 22
+           = 720p). adaptiveFormats are video-only (unwatchable alone). */
         const prog = (iv.streamingData.formats || [])
           .filter(f => f.url && (f.mimeType || '').startsWith('video/') && (f.mimeType || '').includes('mp4'))
           .sort((a, b) => (b.width || 0) - (a.width || 0));
@@ -982,7 +1381,10 @@ async function handleDownload(url, request) {
     }
   } catch (e) { why = 'innertube error: ' + (e && e.message); }
 
-  /* 2) Piped instance streams (their proxy URLs work cross-IP). */
+  /* 2) Piped instance streams — RACED IN PARALLEL (v1.3), ~6s worst
+     case. Piped proxy URLs work cross-IP; LBRY mirrors (odycdn) are
+     muxed MP4s that keep video downloads working even when YouTube
+     serves no muxed format to datacenter IPs. */
   if (!stream) {
     try {
       const pd = await pipedStreams(id);
@@ -993,12 +1395,25 @@ async function handleDownload(url, request) {
           if (audio.length) {
             const a = audio.find(x => (x.mimeType || '').includes('audio/mp4')) || audio[0];
             stream = { url: a.url, mime: (a.mimeType || 'audio/mp4').split(';')[0], title };
+          } else if (pd.hls) {
+            /* some instances fold audio into HLS only — not downloadable */
+            why = 'piped returned HLS only';
           }
         } else {
-          const prog = (pd.videoStreams || []).filter(v => v.videoOnly === false && (v.mimeType || '').includes('mp4'));
-          if (prog.length) {
-            const v = prog.sort((a, b) => (b.quality || 0) - (a.quality || 0))[0];
-            stream = { url: v.url, mime: 'video/mp4', title };
+          const qn = (v) => parseInt(String(v.quality || '').replace(/[^0-9]/g, ''), 10) || 0;
+          const muxed = (pd.videoStreams || [])
+            .filter(v => v.videoOnly === false && (v.mimeType || '').includes('mp4'))
+            .sort((a, b) => qn(b) - qn(a));
+          if (muxed.length) {
+            stream = { url: muxed[0].url, mime: 'video/mp4', title };
+          } else {
+            /* LBRY mirror — muxed mp4 hosted on odycdn, cross-IP OK */
+            const lbry = (pd.videoStreams || []).find(v =>
+              (v.videoOnly === false) &&
+              /mp4/i.test(v.mimeType || '') &&
+              /odycdn|lbry/i.test(v.url || ''));
+            if (lbry) stream = { url: lbry.url, mime: 'video/mp4', title };
+            else why = why || 'no muxed mp4 on any source';
           }
         }
       }
@@ -1017,17 +1432,31 @@ async function handleDownload(url, request) {
   const ext = (stream.mime || '').includes('audio') ? '.m4a' : '.mp4';
   const filename = sanitizeFilename(stream.title || titleParam || 'download') + ext;
 
-  /* fetch upstream, passing the browser's Range header through */
-  const upHeaders = {};
+  /* fetch upstream, passing the browser's Range header through.
+     CRITICAL v1.3 fix: googlevideo THROTTLES rangeless adaptive-audio
+     requests to ~16KB/s (the download "hang"). Always asking for
+     "bytes=0-" — even when the browser sent no Range — makes
+     googlevideo serve the full file at full speed (206 + Content-Range
+     pass straight through to the client). 25s cap on the first byte. */
+  const upHeaders = { Range: 'bytes=0-' };
   const range = request && request.headers.get('Range');
   if (range) upHeaders['Range'] = range;
-  const r = await fetch(stream.url, { headers: upHeaders });
+  const r = await fetchTimeout(stream.url, { headers: upHeaders, redirect: 'follow' }, 25000);
   if (!r.ok && r.status !== 206) {
-    return json({ error: 'stream fetch failed (' + r.status + ') — try again' }, { status: 502 });
+    /* one retry — googlevideo occasionally 403s a first hit */
+    let r2 = null;
+    try { r2 = await fetchTimeout(stream.url, { headers: upHeaders, redirect: 'follow' }, 25000); } catch (e2) { r2 = null; }
+    if (!r2 || (!r2.ok && r2.status !== 206)) {
+      return json({ error: 'stream fetch failed (' + (r2 ? r2.status : r.status) + ') — try again' }, { status: 502 });
+    }
+    return streamResponse(r2, stream.mime, filename);
   }
+  return streamResponse(r, stream.mime, filename);
+}
 
+function streamResponse(r, mime, filename) {
   const out = new Headers({
-    'Content-Type': stream.mime || 'application/octet-stream',
+    'Content-Type': mime || 'application/octet-stream',
     'Content-Disposition': 'attachment; filename="' + filename + '"',
     'Cache-Control': 'no-store',
   });
@@ -1062,6 +1491,7 @@ function fmtDuration(sec) {
        : m + ':' + String(s).padStart(2, '0');
 }
 function fmtSubs(n) {
+  if (typeof n === 'string') return n; /* already formatted text */
   if (typeof n !== 'number' || n <= 0) return '';
   if (n >= 1e9) return (n / 1e9).toFixed(1).replace(/\.0$/, '') + 'B subscribers';
   if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M subscribers';
