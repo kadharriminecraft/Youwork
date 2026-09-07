@@ -1,51 +1,74 @@
 /* =====================================================================
-   YT-ONLY WORKER — a dedicated Cloudflare Worker purpose-built for the
-   YT-Only app (the stripped-down YouTube-only player).
+   YT-ONLY WORKER v1.1 — a dedicated Cloudflare Worker purpose-built for
+   the YT-Only app (the stripped-down YouTube-only player).
 
    Deploy on YOUR Cloudflare account (free tier is fine):
      1. dash.cloudflare.com → Workers & Pages → Create worker
      2. Name it (e.g. yt-only) → Edit code → paste this whole file
      3. Deploy → copy the URL (https://yt-only.YOU.workers.dev)
-     4. In index.html, set WORKER_URL (top of the <script> block) to that URL
+     4. In the app: Settings (gear) → paste the URL → Save → Test connection
 
    What this worker does:
-     - /__yt/health           → version probe ("yt-only-ok/1.0")
+     - /__yt/health           → version probe ("yt-only-ok/1.1")
      - /__yt/search?q=QUERY   → JSON { videos:[{id,title,channel,thumb,duration,...}] }
-     - /__yt/video?id=VID     → JSON { id,title,author,thumb,... } (oEmbed-based)
-     - /__yt/home             → JSON { videos:[...] } (trending / home feed)
-     - /__yt/channel?id=CID   → JSON { header, videos:[...] }
-     - /__yt/img?url=URL       → passthrough image proxy (for thumbnails when blocked)
-     - /__yt/proxy?url=URL     → generic CORS proxy (text/html only)
+     - /__yt/video?id=VID     → JSON { id,title,description,views,date,channel,related }
+     - /__yt/home             → JSON { videos:[...] } (popular feed)
+     - /__yt/channel?id=|handle= → JSON { header, videos:[...] }
+     - /__yt/img?url=URL      → passthrough image proxy
+     - /__yt/proxy?url=URL    → generic CORS proxy
 
-   Why a custom worker (vs. generic CORS proxies):
-     - YouTube search/channel pages don't ship CORS headers, so the browser
-       can't fetch them directly. The worker fetches them server-side and
-       returns CORS-friendly JSON.
-     - YouTube's oembed endpoint DOES allow CORS — we use it directly from
-       the app for video metadata; this worker only adds the data oembed
-       doesn't ship (duration, channel avatar, related videos).
-     - Image thumbnails occasionally get blocked by browser privacy
-       settings; /__yt/img is a thin transparent proxy that always works.
+   WHAT CHANGED IN v1.1 (fixes channel + video details):
+     1. SOCS/CONSENT cookies. YouTube answers datacenter IPs with the
+        consent interstitial — a page with NO ytInitialData. That is why
+        the old worker returned empty metadata for everything.
+     2. ytInitialPlayerResponse no longer carries videoDetails for
+        logged-out scrapes ("Sign in to confirm you're not a bot").
+        Watch metadata now comes entirely from ytInitialData
+        (videoPrimaryInfoRenderer / videoSecondaryInfoRenderer).
+     3. YouTube migrated channel grids and related-video lists to
+        "lockupViewModel". The old parser only knew videoRenderer /
+        compactVideoRenderer / gridVideoRenderer, so channels and
+        related videos came back empty. v1.1 parses lockups everywhere.
+     4. Channel headers migrated to pageHeaderViewModel +
+        channelMetadataRenderer. v1.1 reads title / avatar / handle /
+        subscriber count / description / banner from the new shapes.
+     5. /feed/trending and the logged-out homepage now ship an EMPTY
+        shell. /__yt/home now reads YouTube's official "Most Popular"
+        playlist instead.
+     6. extractJson: proper string-escape handling (the old escape logic
+        could silently fail on JSON containing escaped quotes, e.g.
+        video descriptions).
 
    Iteration guide:
      - To add a new endpoint: add a route in handleRequest() below.
      - All responses use json()/text() helpers that attach CORS headers.
-     - Parsing logic for YouTube HTML is in lib/parse.js (inlined here for
-       single-file deploy). Adjust if YouTube changes their HTML structure.
+     - Parsing logic for YouTube HTML lives below (single-file deploy).
+       If YouTube changes their HTML structure again, this is the only
+       file that needs updating.
    ===================================================================== */
 
 /* ----- version + config -------------------------------------------- */
-const VERSION = '1.0';
+const VERSION = '1.1';
 const HEALTH_TAG = 'yt-only-ok/' + VERSION;
 const YT_HOME = 'https://www.youtube.com';
 
-/* Default request headers sent UP to youtube.com — DESKTOP UA is required:
-   mobile UA gets redirected to m.youtube.com which serves a different
-   HTML shape without ytInitialData, and our parser would find nothing. */
+/* Home feed source. The logged-out homepage AND /feed/trending now
+   return an empty shell (a single feedNudgeRenderer), but playlist
+   pages still ship full ytInitialData with 100 video lockups.
+   This is YouTube's official "Most Popular" playlist. */
+const HOME_PLAYLIST = 'PLFgquLnL59alCl_2TQvOiD5Vgm1hCaGSI';
+
+/* Default request headers sent UP to youtube.com — DESKTOP UA is
+   required: mobile UA gets redirected to m.youtube.com which serves a
+   different HTML shape without ytInitialData.
+   The Cookie header is CRITICAL: SOCS/CONSENT bypasses the consent
+   interstitial YouTube serves to datacenter (Worker) IPs. Without it,
+   every page comes back as a consent form with no ytInitialData. */
 const UPSTREAM_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
   'Accept-Language': 'en-US,en;q=0.9',
+  'Cookie': 'SOCS=CAI; CONSENT=YES+cb.20210328-17-p0.en+FX+419',
 };
 
 /* ----- CORS -------------------------------------------------------- */
@@ -93,12 +116,12 @@ async function handleRequest(request) {
     if (path === '/__yt/search') {
       const q = (url.searchParams.get('q') || '').trim();
       if (!q) return json({ error: 'missing q', videos: [] });
-      const html = await fetchUpstream(YT_HOME + '/results?search_query=' + encodeURIComponent(q) + '&hl=en');
-      const videos = parseVideoResults(html);
+      const html = await fetchUpstream(YT_HOME + '/results?search_query=' + encodeURIComponent(q) + '&hl=en&gl=US');
+      const videos = collectVideos(extractYtInitialData(html));
       return json({ query: q, videos });
     }
 
-    /* video metadata — full /watch page parse ------------------- */
+    /* video metadata — full /watch page parse ---------------------- */
     if (path === '/__yt/video') {
       const id = (url.searchParams.get('id') || '').trim();
       if (!id) return json({ error: 'missing id' });
@@ -107,10 +130,10 @@ async function handleRequest(request) {
       return json(data);
     }
 
-    /* home feed (trending) ----------------------------------------- */
+    /* home feed (popular playlist) ---------------------------------- */
     if (path === '/__yt/home') {
-      const html = await fetchUpstream(YT_HOME + '/feed/trending?hl=en');
-      const videos = parseVideoResults(html);
+      const html = await fetchUpstream(YT_HOME + '/playlist?list=' + HOME_PLAYLIST + '&hl=en');
+      const videos = collectVideos(extractYtInitialData(html), null, 40);
       return json({ videos });
     }
 
@@ -120,7 +143,7 @@ async function handleRequest(request) {
       const handle = (url.searchParams.get('handle') || '').trim();
       if (!id && !handle) return json({ error: 'missing id or handle' });
       const target = handle
-        ? YT_HOME + '/' + handle.replace(/^@/, '@') + '/videos?hl=en'
+        ? YT_HOME + '/' + (handle.startsWith('@') ? handle : '@' + handle) + '/videos?hl=en'
         : YT_HOME + '/channel/' + id + '/videos?hl=en';
       const html = await fetchUpstream(target);
       const data = parseChannel(html);
@@ -169,314 +192,85 @@ async function handleRequest(request) {
   }
 }
 
-/* ----- upstream fetch --------------------------------------------- */
+/* ----- upstream fetch --------------------------------------------- *
+ * Retries with backoff — YouTube intermittently throttles bursts of
+ * datacenter-IP requests (429) or answers with a redirect-to-consent.
+ * Waiting and retrying resolves the vast majority of those. */
 async function fetchUpstream(u) {
-  const r = await fetch(u, { headers: UPSTREAM_HEADERS, redirect: 'follow' });
-  if (!r.ok) throw new Error('upstream ' + r.status + ' for ' + u);
-  return r.text();
+  const DELAYS = [0, 500, 1300];
+  let lastErr = null;
+  for (let attempt = 0; attempt < DELAYS.length; attempt++) {
+    if (DELAYS[attempt]) await new Promise(res => setTimeout(res, DELAYS[attempt]));
+    try {
+      const r = await fetch(u, { headers: UPSTREAM_HEADERS, redirect: 'follow' });
+      if (r.ok) return r.text();
+      lastErr = new Error('upstream ' + r.status + ' for ' + u);
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('upstream failed for ' + u);
 }
 
 /* ----- HTML → JSON parsing -----------------------------------------
    YouTube embeds JSON blobs (ytInitialData, ytInitialPlayerResponse) in
    the page HTML. We use a brace-balanced extractor instead of a regex —
-   regexes fail on the watch page because the JSON contains nested
-   objects with `}` characters that confuse non-greedy matching.
+   regexes fail because the JSON contains nested objects with `}`
+   characters that confuse non-greedy matching.
 
-   If YouTube changes their HTML structure, this is the only place
-   that needs updating. */
-function extractJson(html, varName){
-  const startPat = new RegExp(varName + '\\s*=\\s*');
-  const sm = html.match(startPat);
+   v1.1 note: escape handling inside strings is now correct (the old
+   version mis-handled escaped quotes, which broke any blob containing
+   `\"` — video descriptions, titles with quotes, etc). */
+function extractJson(html, varName) {
+  const sm = new RegExp(varName + '\\s*=\\s*').exec(html);
   if (!sm) return null;
   let i = sm.index + sm[0].length;
   while (i < html.length && /\s/.test(html[i])) i++;
   if (html[i] !== '{') return null;
-  let depth = 0, start = i, inStr = false, esc = false, quote = '';
-  while (i < html.length){
+  let depth = 0, start = i, inStr = false, esc = false;
+  while (i < html.length) {
     const c = html[i];
-    if (inStr){
+    if (inStr) {
       if (esc) esc = false;
-      else if (c === '\\\\') esc = true;
-      else if (c === quote) inStr = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
     } else {
-      if (c === '"' || c === "'"){ inStr = true; quote = c; }
+      if (c === '"') inStr = true;
       else if (c === '{') depth++;
-      else if (c === '}'){
+      else if (c === '}') {
         depth--;
-        if (depth === 0){ try { return JSON.parse(html.slice(start, i + 1)); } catch (e) { return null; } }
+        if (depth === 0) {
+          try { return JSON.parse(html.slice(start, i + 1)); } catch (e) { return null; }
+        }
       }
     }
     i++;
   }
   return null;
 }
-function extractYtInitialData(html){
+function extractYtInitialData(html) {
   return extractJson(html, 'ytInitialData');
 }
-function extractYtInitialPlayerResponse(html){
+function extractYtInitialPlayerResponse(html) {
   return extractJson(html, 'ytInitialPlayerResponse');
 }
 
-/* Walk ytInitialData and pull out every video renderer we can find. */
-function parseVideoResults(html) {
-  const data = extractYtInitialData(html);
-  if (!data) return [];
-  const out = [];
-  const seen = {};
-
-  function visit(node) {
-    if (!node || typeof node !== 'object') return;
-    /* videoRenderer is the search-results shape */
-    if (node.videoRenderer) {
-      const v = extractVideoRenderer(node.videoRenderer);
-      if (v && !seen[v.id]) { seen[v.id] = 1; out.push(v); }
-    }
-    /* compactVideoRenderer is the "up next" / channel list shape */
-    if (node.compactVideoRenderer) {
-      const v = extractVideoRenderer(node.compactVideoRenderer);
-      if (v && !seen[v.id]) { seen[v.id] = 1; out.push(v); }
-    }
-    /* gridVideoRenderer is the channel-page grid shape */
-    if (node.gridVideoRenderer) {
-      const v = extractVideoRenderer(node.gridVideoRenderer);
-      if (v && !seen[v.id]) { seen[v.id] = 1; out.push(v); }
-    }
-    /* playlistVideoRenderer (rare in our paths) */
-    if (node.playlistVideoRenderer) {
-      const v = extractVideoRenderer(node.playlistVideoRenderer);
-      if (v && !seen[v.id]) { seen[v.id] = 1; out.push(v); }
-    }
-    for (const k in node) {
-      const v = node[k];
-      if (Array.isArray(v)) v.forEach(visit);
-      else if (v && typeof v === 'object') visit(v);
-    }
-  }
-  visit(data);
-  return out;
+/* ----- generic helpers -------------------------------------------- */
+function isValidVideoId(s) {
+  return /^[A-Za-z0-9_-]{11}$/.test(String(s || ''));
 }
-
-function extractVideoRenderer(r) {
-  try {
-    const id = r.videoId;
-    if (!id) return null;
-    const titleNode = r.title && (r.title.runs && r.title.runs[0] || r.title.simpleText);
-    const title = (titleNode && (titleNode.text || titleNode)) || '';
-    const thumb = (r.thumbnail && r.thumbnail.thumbnails && r.thumbnail.thumbnails.slice(-1)[0].url) || '';
-    const channel = (r.ownerText && r.ownerText.runs && r.ownerText.runs[0] && r.ownerText.runs[0].text)
-      || (r.shortBylineText && r.shortBylineText.runs && r.shortBylineText.runs[0] && r.shortBylineText.runs[0].text)
-      || '';
-    const channelId = (r.ownerText && r.ownerText.runs && r.ownerText.runs[0] && r.ownerText.runs[0].navigationEndpoint && r.ownerText.runs[0].navigationEndpoint.browseEndpoint && r.ownerText.runs[0].navigationEndpoint.browseEndpoint.browseId)
-      || (r.channelId) || '';
-    const duration = (r.lengthText && r.lengthText.simpleText) || (r.lengthText && r.lengthText.accessibility && r.lengthText.accessibility.accessibilityData && r.lengthText.accessibility.accessibilityData.label) || '';
-    const views = (r.viewCountText && r.viewCountText.simpleText) || '';
-    const date = (r.publishedTimeText && r.publishedTimeText.simpleText) || '';
-    const description = (r.detailedMetadataSnippets && r.detailedMetadataSnippets[0] && r.detailedMetadataSnippets[0].snippetText && r.detailedMetadataSnippets[0].snippetText.runs && r.detailedMetadataSnippets[0].snippetText.runs.map(x=>x.text).join('')) || '';
-    return { id, title, thumb, channel, channelId, duration, views, date, description };
-  } catch (e) {
-    return null;
-  }
+/* Normalize any text node shape (simpleText | runs | content | string). */
+function textOf(t) {
+  if (t == null) return '';
+  if (typeof t === 'string') return t;
+  if (typeof t === 'number') return String(t);
+  if (t.simpleText) return t.simpleText;
+  if (t.content) return t.content;
+  if (t.runs) return t.runs.map(r => r.text).join('');
+  if (t.text) return textOf(t.text);
+  return '';
 }
-
-function parseChannel(html) {
-  const data = extractYtInitialData(html);
-  if (!data) return { header: {}, videos: [] };
-  let header = {};
-  try {
-    const c = findFirst(data, 'c4TabbedHeaderRenderer') || findFirst(data, 'pageHeaderRenderer');
-    if (c) {
-      header = {
-        id: c.channelId || (c.metadata && c.metadata.channelMetadataRenderer && c.metadata.channelMetadataRenderer.externalId) || '',
-        title: c.title || '',
-        avatar: (c.avatar && c.avatar.thumbnails && c.avatar.thumbnails.slice(-1)[0].url) || '',
-        subs: (c.subscriberCountText && c.subscriberCountText.simpleText) || '',
-        handle: '',
-      };
-    }
-  } catch (e) {}
-  const videos = parseVideoResults(html);
-  return { header, videos };
-}
-
-/* ----- video metadata via full /watch page parse ----------------- *
- * Returns: { id, title, description, views, date, duration, thumb,
- *           channel: { id, name, avatar, url },
- *           related: [video, video, ...] }
- *
- * Two JSON blobs drive this:
- *   - ytInitialPlayerResponse.videoDetails — title, description, views,
- *     duration, channel name + id
- *   - ytInitialData.contents.twoColumnWatchNextResults — channel avatar,
- *     date, related videos (newer shape uses lockupViewModel) */
-function parseWatchPage(html, videoId) {
-  const result = {
-    id: videoId,
-    title: '',
-    description: '',
-    views: '',
-    date: '',
-    duration: '',
-    thumb: 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg',
-    channel: { id: '', name: '', avatar: '', url: '' },
-    related: [],
-  };
-
-  const player = extractYtInitialPlayerResponse(html);
-  if (player && player.videoDetails){
-    const vd = player.videoDetails;
-    result.title = vd.title || '';
-    result.description = vd.shortDescription || '';
-    if (vd.viewCount) result.views = parseInt(vd.viewCount, 10).toLocaleString() + ' views';
-    if (vd.lengthSeconds){
-      const s = parseInt(vd.lengthSeconds, 10) || 0;
-      const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
-      result.duration = h > 0
-        ? h + ':' + String(m).padStart(2,'0') + ':' + String(sec).padStart(2,'0')
-        : m + ':' + String(sec).padStart(2,'0');
-    }
-    result.channel.id = vd.channelId || '';
-    result.channel.name = vd.author || '';
-    if (vd.thumbnail && vd.thumbnail.thumbnails && vd.thumbnail.thumbnails.length){
-      result.thumb = vd.thumbnail.thumbnails.slice(-1)[0].url;
-    }
-  }
-
-  const data = extractYtInitialData(html);
-  if (data){
-    const wr = data.contents && data.contents.twoColumnWatchNextResults;
-    if (wr){
-      /* Channel avatar + date live in results.contents */
-      if (wr.results && wr.results.results && wr.results.results.contents){
-        for (const item of wr.results.results.contents){
-          const si = item.videoSecondaryInfoRenderer || item.slimVideoMetadataRenderer;
-          if (si && si.owner && si.owner.videoOwnerRenderer){
-            const owner = si.owner.videoOwnerRenderer;
-            if (owner.thumbnail && owner.thumbnail.thumbnails && owner.thumbnail.thumbnails.length){
-              result.channel.avatar = owner.thumbnail.thumbnails.slice(-1)[0].url;
-            }
-            if (owner.title && owner.title.runs){
-              result.channel.name = owner.title.runs.map(r => r.text).join('') || result.channel.name;
-            }
-            if (owner.navigationEndpoint && owner.navigationEndpoint.browseEndpoint){
-              result.channel.id = owner.navigationEndpoint.browseEndpoint.browseId || result.channel.id;
-            }
-            if (owner.subscriberCountText){
-              result.channel.subs = owner.subscriberCountText.simpleText ||
-                (owner.subscriberCountText.runs && owner.subscriberCountText.runs.map(r => r.text).join('')) || '';
-            }
-          }
-          if (item.videoPrimaryInfoRenderer || item.compositeVideoPrimaryInfoRenderer){
-            const pi = item.videoPrimaryInfoRenderer || (item.compositeVideoPrimaryInfoRenderer && item.compositeVideoPrimaryInfoRenderer.content && item.compositeVideoPrimaryInfoRenderer.content.videoPrimaryInfoRenderer);
-            if (pi){
-              if (pi.viewCount && pi.viewCount.videoViewCountRenderer && pi.viewCount.videoViewCountRenderer.viewCount){
-                result.views = pi.viewCount.videoViewCountRenderer.viewCount.simpleText || result.views;
-              }
-              if (pi.dateText){
-                result.date = pi.dateText.simpleText ||
-                  (pi.dateText.runs && pi.dateText.runs.map(r => r.text).join('')) || '';
-              }
-            }
-          }
-        }
-      }
-      /* Related videos live in secondaryResults. Newer YouTube serves
-         them inside an itemSectionRenderer.contents[] as lockupViewModel.
-         Older shape: results[] as compactVideoRenderer. Handle both. */
-      if (wr.secondaryResults && wr.secondaryResults.secondaryResults && wr.secondaryResults.secondaryResults.results){
-        const items = wr.secondaryResults.secondaryResults.results;
-        const related = [];
-        for (const item of items){
-          /* Old shape */
-          if (item.compactVideoRenderer){
-            const v = extractVideoRenderer(item.compactVideoRenderer);
-            if (v) related.push(v);
-          }
-          /* Autoplay wrapper (old shape) */
-          if (item.compactAutoplayRenderer && item.compactAutoplayRenderer.contents){
-            for (const inner of item.compactAutoplayRenderer.contents){
-              if (inner.compactVideoRenderer){
-                const v = extractVideoRenderer(inner.compactVideoRenderer);
-                if (v) related.push(v);
-              }
-            }
-          }
-          /* New shape: itemSectionRenderer.contents[].lockupViewModel */
-          if (item.itemSectionRenderer && item.itemSectionRenderer.contents){
-            for (const inner of item.itemSectionRenderer.contents){
-              if (inner.lockupViewModel){
-                const v = extractLockupViewModel(inner.lockupViewModel);
-                if (v) related.push(v);
-              }
-              if (inner.compactVideoRenderer){
-                const v = extractVideoRenderer(inner.compactVideoRenderer);
-                if (v) related.push(v);
-              }
-            }
-          }
-        }
-        result.related = related;
-      }
-    }
-  }
-
-  if (result.channel.id) result.channel.url = 'https://www.youtube.com/channel/' + result.channel.id;
-  return result;
-}
-
-/* Parse the newer lockupViewModel shape into our standard video record. */
-function extractLockupViewModel(vm){
-  try {
-    if (!vm) return null;
-    let id = vm.contentId || '';
-    const md = vm.metadata && vm.metadata.lockupMetadataViewModel;
-    if (!id && md){
-      /* fallback: extract from thumbnail URL */
-    }
-    if (!id){
-      const img = vm.contentImage && vm.contentImage.thumbnailViewModel && vm.contentImage.thumbnailViewModel.image;
-      const src = img && img.sources && img.sources.length && img.sources[0].url;
-      if (src){
-        const m = src.match(/\/vi\/([A-Za-z0-9_-]{11})\//);
-        if (m) id = m[1];
-      }
-    }
-    if (!id) return null;
-    const title = md && md.title && md.title.content || '';
-    const img = vm.contentImage && vm.contentImage.thumbnailViewModel && vm.contentImage.thumbnailViewModel.image;
-    const thumb = img && img.sources && img.sources.length ? img.sources.slice(-1)[0].url : '';
-    /* Channel name + avatar live in metadata.lockupMetadataViewModel.image.decoratedAvatarViewModel */
-    let channel = '', channelAvatar = '', channelId = '';
-    if (md && md.image && md.image.decoratedAvatarViewModel && md.image.decoratedAvatarViewModel.avatar && md.image.decoratedAvatarViewModel.avatar.avatarViewModel){
-      const av = md.image.decoratedAvatarViewModel.avatar.avatarViewModel;
-      if (av.image && av.image.sources && av.image.sources.length) channelAvatar = av.image.sources.slice(-1)[0].url;
-      /* a11yLabel is like "Go to channel NAME" */
-      if (md.image.decoratedAvatarViewModel.a11yLabel){
-        const m = /Go to channel (.+)$/i.exec(md.image.decoratedAvatarViewModel.a11yLabel);
-        if (m) channel = m[1];
-      }
-    }
-    /* Duration: hunt for thumbnailBadgeViewModel in overlays */
-    let duration = '';
-    if (vm.contentImage && vm.contentImage.thumbnailViewModel && vm.contentImage.thumbnailViewModel.overlays){
-      for (const ov of vm.contentImage.thumbnailViewModel.overlays){
-        if (ov.thumbnailBottomOverlayViewModel && ov.thumbnailBottomOverlayViewModel.badges){
-          for (const b of ov.thumbnailBottomOverlayViewModel.badges){
-            if (b.thumbnailBadgeViewModel && b.thumbnailBadgeViewModel.text){
-              duration = b.thumbnailBadgeViewModel.text;
-              break;
-            }
-          }
-        }
-      }
-    }
-    /* Channel ID: buried deep in rendererContext or commandContext — best-effort */
-    const json = JSON.stringify(vm);
-    const cidm = /"browseId":"([A-Za-z0-9_-]+)"/.exec(json);
-    if (cidm) channelId = cidm[1];
-    return { id, title, thumb, channel, channelId, duration, views:'', date:'', description:'' };
-  } catch (e){ return null; }
-}
-
+/* Find the first node stored under `key` anywhere in the tree. */
 function findFirst(node, key) {
   if (!node || typeof node !== 'object') return null;
   if (node[key]) return node[key];
@@ -494,21 +288,407 @@ function findFirst(node, key) {
   }
   return null;
 }
-
-/* ----- video metadata via oEmbed (legacy, unused — kept for reference) */
-async function fetchVideoMeta(id) {
-  const watchUrl = YT_HOME + '/watch?v=' + id;
-  const oembedUrl = YT_HOME + '/oembed?url=' + encodeURIComponent(watchUrl) + '&format=json';
-  const r = await fetch(oembedUrl, { headers: UPSTREAM_HEADERS });
-  if (!r.ok) {
-    return { id, title: 'Video', author: '', thumb: 'https://i.ytimg.com/vi/' + id + '/hqdefault.jpg' };
+/* Pick a reasonable thumbnail from a sources array (prefer ~360px wide). */
+function pickThumb(sources) {
+  if (!sources || !sources.length) return '';
+  let best = sources[sources.length - 1];
+  for (const s of sources) {
+    if (s.width && s.width >= 320) { best = s; break; }
   }
-  const j = await r.json();
-  return {
-    id,
-    title: j.title || 'Video',
-    author: j.author_name || '',
-    authorUrl: j.author_url || '',
-    thumb: j.thumbnail_url || ('https://i.ytimg.com/vi/' + id + '/hqdefault.jpg'),
+  return best.url || '';
+}
+
+/* ----- video collection --------------------------------------------
+   Walk the ENTIRE ytInitialData tree and pull out every video we can
+   find, regardless of which renderer shape YouTube wraps it in.
+
+   Shapes handled (2025):
+     - videoRenderer          → search results
+     - compactVideoRenderer   → legacy "up next" lists
+     - gridVideoRenderer      → legacy channel grids
+     - playlistVideoRenderer  → legacy playlist pages
+     - lockupViewModel        → NEW: search, channel grids, playlists,
+                                watch related videos ("lockup" migration)
+     - shortsLockupViewModel  → shorts shelves
+
+   `excludeId` drops the current video (used by the watch endpoint).
+   `limit` caps the result count (0 = unlimited). */
+function collectVideos(data, excludeId, limit) {
+  if (!data) return [];
+  const out = [];
+  const seen = {};
+
+  function visit(node) {
+    if (!node || typeof node !== 'object') return;
+    if (limit && out.length >= limit) return;
+
+    let v = null;
+    if (node.videoRenderer) v = extractVideoRenderer(node.videoRenderer);
+    else if (node.compactVideoRenderer) v = extractVideoRenderer(node.compactVideoRenderer);
+    else if (node.gridVideoRenderer) v = extractVideoRenderer(node.gridVideoRenderer);
+    else if (node.playlistVideoRenderer) v = extractVideoRenderer(node.playlistVideoRenderer);
+    else if (node.lockupViewModel) v = extractLockupViewModel(node.lockupViewModel);
+    else if (node.shortsLockupViewModel) v = extractShortsLockup(node.shortsLockupViewModel);
+
+    if (v && v.id && v.id !== excludeId && !seen[v.id]) {
+      seen[v.id] = 1;
+      out.push(v);
+    }
+
+    for (const k in node) {
+      const val = node[k];
+      if (val && typeof val === 'object') visit(val);
+    }
+  }
+  visit(data);
+  return out;
+}
+
+/* Classic renderer (search results, legacy layouts). */
+function extractVideoRenderer(r) {
+  try {
+    const id = r.videoId;
+    if (!id) return null;
+    const title = textOf(r.title);
+    const thumb = pickThumb(r.thumbnail && r.thumbnail.thumbnails)
+      || ('https://i.ytimg.com/vi/' + id + '/hqdefault.jpg');
+    const channel = textOf(r.ownerText) || textOf(r.shortBylineText) || textOf(r.longBylineText) || '';
+    const channelId = (r.ownerText && r.ownerText.runs && r.ownerText.runs[0] &&
+      r.ownerText.runs[0].navigationEndpoint && r.ownerText.runs[0].navigationEndpoint.browseEndpoint &&
+      r.ownerText.runs[0].navigationEndpoint.browseEndpoint.browseId)
+      || r.channelId || '';
+    const duration = textOf(r.lengthText);
+    const views = textOf(r.viewCountText);
+    const date = textOf(r.publishedTimeText);
+    const description = (r.detailedMetadataSnippets && r.detailedMetadataSnippets[0] &&
+      textOf(r.detailedMetadataSnippets[0].snippetText)) || '';
+    return { id, title, thumb, channel, channelId, duration, views, date, description };
+  } catch (e) {
+    return null;
+  }
+}
+
+/* NEW lockup shape (channel grids, playlist pages, related videos).
+   A lockup is a generic card — check contentType so we only keep
+   VIDEO lockups (not playlists / channels / posts). */
+function extractLockupViewModel(vm) {
+  try {
+    if (!vm) return null;
+    const ctype = vm.contentType || '';
+    if (ctype && !/VIDEO/i.test(ctype)) return null;
+
+    let id = vm.contentId || '';
+    if (!isValidVideoId(id)) {
+      /* contentId can be a playlist id (PL…) — only accept video ids */
+      const md0 = vm.metadata && vm.metadata.lockupMetadataViewModel;
+      const src0 = md0 && md0.image && ''; /* no-op guard */
+      const tv0 = vm.contentImage && vm.contentImage.thumbnailViewModel;
+      const src = tv0 && tv0.image && pickThumb(tv0.image.sources);
+      if (src) {
+        const m = /\/vi\/([A-Za-z0-9_-]{11})\//.exec(src);
+        if (m) id = m[1];
+      }
+    }
+    if (!isValidVideoId(id)) return null;
+
+    const md = vm.metadata && vm.metadata.lockupMetadataViewModel;
+    const title = (md && md.title && md.title.content) || '';
+
+    const tv = vm.contentImage && vm.contentImage.thumbnailViewModel;
+    const thumb = (tv && tv.image && pickThumb(tv.image.sources))
+      || ('https://i.ytimg.com/vi/' + id + '/hqdefault.jpg');
+
+    /* Metadata rows: [channel], then [views, date] — but on channel
+       pages there is no channel row, just [views, date].
+       Parts carry accessibilityLabel ("132 thousand views",
+       "11 years ago") which disambiguates the compact texts. */
+    let channel = '', channelId = '', views = '', date = '';
+    const rows = md && md.metadata && md.metadata.contentMetadataViewModel &&
+      md.metadata.contentMetadataViewModel.metadataRows || [];
+    for (const row of rows) {
+      for (const p of (row.metadataParts || [])) {
+        const label = p.accessibilityLabel || '';
+        const t = p.text ? textOf(p.text) : '';
+        if (!t && !label) continue;
+        if (/views?$/i.test(t) || /\bviews\b/i.test(label)) { if (!views) views = t; }
+        else if (/ago$/i.test(t) || /streamed|premiere/i.test(t) || /\bago\b/i.test(label)) { if (!date) date = t; }
+        else if (!channel) channel = t;
+        /* channel link + browseId inside commandRuns */
+        if (!channelId && p.text && p.text.commandRuns) {
+          for (const cr of p.text.commandRuns) {
+            const be = cr && cr.onTap && cr.onTap.browseEndpoint;
+            if (be && be.browseId && /^UC[A-Za-z0-9_-]{20,}$/.test(be.browseId)) channelId = be.browseId;
+          }
+        }
+      }
+    }
+
+    /* Channel avatar (search-related lockups) */
+    let channelAvatar = '';
+    if (md && md.image && md.image.decoratedAvatarViewModel && md.image.decoratedAvatarViewModel.avatar) {
+      const av = md.image.decoratedAvatarViewModel.avatar.avatarViewModel;
+      if (av && av.image && av.image.sources) channelAvatar = pickThumb(av.image.sources);
+    }
+
+    /* best-effort channelId via regex (related-video lockups) */
+    if (!channelId) {
+      try {
+        const cidm = /"browseId":"(UC[A-Za-z0-9_-]{20,})"/.exec(JSON.stringify(vm));
+        if (cidm) channelId = cidm[1];
+      } catch (e) {}
+    }
+
+    /* Duration: thumbnail badge inside overlays ("12:28") */
+    let duration = '';
+    if (tv && tv.overlays) {
+      const badges = [];
+      (function hunt(n) {
+        if (!n || typeof n !== 'object') return;
+        if (n.thumbnailBadgeViewModel && n.thumbnailBadgeViewModel.text) {
+          badges.push(typeof n.thumbnailBadgeViewModel.text === 'string'
+            ? n.thumbnailBadgeViewModel.text
+            : textOf(n.thumbnailBadgeViewModel.text));
+        }
+        for (const k in n) { const v = n[k]; if (v && typeof v === 'object') hunt(v); }
+      })(tv.overlays);
+      for (const b of badges) {
+        if (/^\d+(:\d+)+$/.test(b) || /^LIVE$/i.test(b)) { duration = b; break; }
+      }
+    }
+
+    return { id, title, thumb, channel, channelId, channelAvatar, duration, views, date, description: '' };
+  } catch (e) {
+    return null;
+  }
+}
+
+/* Shorts shelf item. entityId like "shorts-shorts-item-VIDEOID". */
+function extractShortsLockup(sl) {
+  try {
+    if (!sl) return null;
+    const id = String(sl.entityId || '').split('-').pop();
+    if (!isValidVideoId(id)) return null;
+    const om = sl.overlayMetadata || {};
+    const title = (om.primaryText && textOf(om.primaryText)) ||
+      String(sl.accessibilityText || '').split('|')[0].trim() || '';
+    const views = (om.secondaryText && textOf(om.secondaryText)) || '';
+    const tv = sl.thumbnailViewModel;
+    const thumb = (tv && tv.image && pickThumb(tv.image.sources))
+      || ('https://i.ytimg.com/vi/' + id + '/hqdefault.jpg');
+    return { id, title, thumb, channel: '', channelId: '', duration: '', views, date: '', description: '' };
+  } catch (e) {
+    return null;
+  }
+}
+
+/* ----- channel page ------------------------------------------------ *
+ * Modern channel pages (2024/2025):
+ *   - data.metadata.channelMetadataRenderer → canonical id, title,
+ *     avatar, description, vanity handle
+ *   - data.header.pageHeaderRenderer.content.pageHeaderViewModel →
+ *     title, avatar, metadata rows: ["@handle", "1.2M subscribers",
+ *     "1.8K videos"], description preview
+ *   - videos tab: richItemRenderer → lockupViewModel (VIDEO only)
+ *   - legacy fallback: c4TabbedHeaderRenderer + gridVideoRenderer */
+function parseChannel(html) {
+  const data = extractYtInitialData(html);
+  if (!data) return { header: {}, videos: [] };
+
+  const header = {};
+
+  /* 1. channelMetadataRenderer — the canonical source */
+  try {
+    const md = data.metadata && data.metadata.channelMetadataRenderer;
+    if (md) {
+      header.id = md.externalId || '';
+      header.title = md.title || '';
+      header.desc = md.description || '';
+      if (md.avatar && md.avatar.thumbnails) header.avatar = pickThumb(md.avatar.thumbnails);
+      if (md.vanityChannelUrl) {
+        const m = /\/(@[^\/\?#]+)/.exec(md.vanityChannelUrl);
+        if (m) header.handle = m[1];
+      }
+      if (md.channelUrl) {
+        const m = /channel\/([A-Za-z0-9_-]+)/.exec(md.channelUrl);
+        if (m && !header.id) header.id = m[1];
+      }
+    }
+  } catch (e) {}
+
+  /* 2. pageHeaderViewModel — subs / videos count / avatar / handle */
+  try {
+    const phv = findFirst(data, 'pageHeaderViewModel');
+    if (phv) {
+      if (!header.title) {
+        header.title = textOf(phv.title && (phv.title.dynamicTextViewModel ?
+          phv.title.dynamicTextViewModel.text : phv.title)) || '';
+      }
+      if (!header.avatar) {
+        const av = findFirst(phv, 'avatarViewModel');
+        if (av && av.image && av.image.sources) header.avatar = pickThumb(av.image.sources);
+      }
+      if (!header.desc) {
+        const dp = phv.description && phv.description.descriptionPreviewViewModel;
+        if (dp && dp.description) header.desc = dp.description.content || '';
+      }
+      const rows = phv.metadata && phv.metadata.contentMetadataViewModel &&
+        phv.metadata.contentMetadataViewModel.metadataRows || [];
+      for (const row of rows) {
+        for (const p of (row.metadataParts || [])) {
+          const t = p.text ? textOf(p.text) : '';
+          if (!t) continue;
+          if (/subscriber/i.test(t) && !header.subs) header.subs = t;
+          else if (/videos$/i.test(t) && !header.videosCount) header.videosCount = t;
+          else if (t.indexOf('@') === 0 && !header.handle) header.handle = t;
+        }
+      }
+    }
+  } catch (e) {}
+
+  /* 3. legacy c4TabbedHeaderRenderer fallback */
+  try {
+    const c4 = findFirst(data, 'c4TabbedHeaderRenderer');
+    if (c4) {
+      if (!header.id && c4.channelId) header.id = c4.channelId;
+      if (!header.title && c4.title) header.title = c4.title;
+      if (!header.avatar && c4.avatar && c4.avatar.thumbnails) header.avatar = pickThumb(c4.avatar.thumbnails);
+      if (!header.subs && c4.subscriberCountText) header.subs = textOf(c4.subscriberCountText);
+    }
+  } catch (e) {}
+
+  /* 4. banner (best-effort, both shapes) */
+  try {
+    const banner = findFirst(data, 'imageBannerViewModel');
+    if (banner && banner.image && banner.image.sources) header.banner = pickThumb(banner.image.sources);
+    if (!header.banner) {
+      const b2 = findFirst(data, 'banner');
+      if (b2 && b2.thumbnails) header.banner = pickThumb(b2.thumbnails);
+    }
+  } catch (e) {}
+
+  if (header.id) header.url = 'https://www.youtube.com/channel/' + header.id;
+
+  /* 5. videos — walk the whole tree (lockups + legacy renderers).
+     Filter to VIDEO lockups happens inside extractLockupViewModel,
+     so playlist lockups (shown on no-video channels) are skipped. */
+  const videos = collectVideos(data, null, 60);
+
+  /* On channel pages the lockups carry no channel row — inject the
+     header info so the frontend cards show the right channel. */
+  if (header.title || header.id) {
+    for (const v of videos) {
+      if (!v.channel) v.channel = header.title || '';
+      if (!v.channelId) v.channelId = header.id || '';
+    }
+  }
+
+  return { header, videos };
+}
+
+/* ----- video metadata via full /watch page parse ------------------- *
+ * Returns: { id, title, description, views, date, duration, thumb,
+ *           channel: { id, name, avatar, url, subs, handle },
+ *           related: [video, video, ...] }
+ *
+ * IMPORTANT (2025): ytInitialPlayerResponse comes back with
+ * playabilityStatus LOGIN_REQUIRED ("Sign in to confirm you're not a
+ * bot") for logged-out scrapes — videoDetails is GONE. All metadata
+ * now comes from ytInitialData:
+ *   - videoPrimaryInfoRenderer   → title, viewCount, dateText
+ *   - videoSecondaryInfoRenderer → owner (avatar/name/id/subs),
+ *                                  attributedDescription */
+function parseWatchPage(html, videoId) {
+  const result = {
+    id: videoId,
+    title: '',
+    description: '',
+    views: '',
+    date: '',
+    duration: '',
+    thumb: 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg',
+    channel: { id: '', name: '', avatar: '', url: '', subs: '', handle: '' },
+    related: [],
   };
+
+  const data = extractYtInitialData(html);
+  if (!data) {
+    /* last-resort: try player response (works on some pages) */
+    const player = extractYtInitialPlayerResponse(html);
+    if (player && player.videoDetails) applyVideoDetails(result, player.videoDetails);
+    return result;
+  }
+
+  /* --- primary info: title / views / date --- */
+  try {
+    const pi = findFirst(data, 'videoPrimaryInfoRenderer');
+    if (pi) {
+      if (!result.title) result.title = textOf(pi.title);
+      const vc = pi.viewCount && pi.viewCount.videoViewCountRenderer;
+      if (vc && vc.viewCount) result.views = textOf(vc.viewCount) || result.views;
+      if (pi.dateText) result.date = textOf(pi.dateText);
+      if (pi.relativeDateText && !result.date) result.date = textOf(pi.relativeDateText);
+    }
+  } catch (e) {}
+
+  /* --- secondary info: channel owner + description --- */
+  try {
+    const owner = findFirst(data, 'videoOwnerRenderer');
+    if (owner) {
+      if (owner.thumbnail && owner.thumbnail.thumbnails) {
+        result.channel.avatar = pickThumb(owner.thumbnail.thumbnails);
+      }
+      if (owner.title && owner.title.runs) {
+        result.channel.name = owner.title.runs.map(r => r.text).join('') || result.channel.name;
+        const run0 = owner.title.runs[0];
+        const nep = run0 && run0.navigationEndpoint;
+        const be = nep && nep.browseEndpoint;
+        if (be && be.browseId) result.channel.id = be.browseId;
+        if (be && be.canonicalBaseUrl && String(be.canonicalBaseUrl).indexOf('/@') === 0) {
+          result.channel.handle = be.canonicalBaseUrl.slice(1);
+        }
+      }
+      if (owner.subscriberCountText) {
+        result.channel.subs = textOf(owner.subscriberCountText);
+      }
+    }
+  } catch (e) {}
+
+  try {
+    const si = findFirst(data, 'videoSecondaryInfoRenderer');
+    if (si && si.attributedDescription && si.attributedDescription.content) {
+      result.description = si.attributedDescription.content;
+    } else if (si && si.description) {
+      result.description = textOf(si.description);
+    }
+  } catch (e) {}
+
+  /* --- player response: still try videoDetails (works when YouTube
+         serves a full player response; harmless when it doesn't) --- */
+  try {
+    const player = extractYtInitialPlayerResponse(html);
+    if (player && player.videoDetails) applyVideoDetails(result, player.videoDetails);
+    const mf = player && player.microformat && player.microformat.playerMicroformatRenderer;
+    if (mf) {
+      if (!result.date) result.date = mf.publishDate || mf.uploadDate || '';
+      if (!result.channel.id && mf.externalChannelId) result.channel.id = mf.externalChannelId;
+    }
+  } catch (e) {}
+
+  /* --- related videos: walk the whole tree (lockups + compact +
+         shorts shelves), excluding the current video --- */
+  result.related = collectVideos(data, videoId, 24);
+
+  if (result.channel.id) result.channel.url = 'https://www.youtube.com/channel/' + result.channel.id;
+  return result;
+}
+
+function applyVideoDetails(result, vd) {
+  if (!result.title) result.title = vd.title || '';
+  if (!result.description) result.description = vd.shortDescription || '';
+  if (!result.views && vd.viewCount) result.views = parseInt(vd.viewCount, 10).toLocaleString('en-US') + ' views';
+  if (!result.channel.id) result.channel.id = vd.channelId || '';
+  if (!result.channel.name) result.channel.name = vd.author || '';
+  if (vd.thumbnail && vd.thumbnail.thumbnails && vd.thumbnail.thumbnails.length) {
+    result.thumb = vd.thumbnail.thumbnails[vd.thumbnail.thumbnails.length - 1].url;
+  }
 }
