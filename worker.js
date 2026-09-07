@@ -1,5 +1,5 @@
 /* =====================================================================
-   YT-ONLY WORKER v1.7 — a dedicated Cloudflare Worker purpose-built for
+   YT-ONLY WORKER v1.8 — a dedicated Cloudflare Worker purpose-built for
    the YT-Only app (the stripped-down YouTube-only player).
 
    Deploy on YOUR Cloudflare account (free tier is fine):
@@ -9,7 +9,7 @@
      4. In the app: Settings (gear) → paste the URL → Save → Test connection
 
    What this worker does:
-     - /__yt/health           → version probe ("yt-only-ok/1.7")
+     - /__yt/health           → version probe ("yt-only-ok/1.8")
      - /__yt/search?q=QUERY   → JSON { videos:[...], channels:[...] }
        v1.5: three sources RACE IN PARALLEL (innertube ANDROID_VR API +
        HTML scrape + Piped) — fast AND throttle-proof.
@@ -17,6 +17,8 @@
        v1.5: watch scrape + innertube player + Piped race in parallel.
        v1.7: + innertube SEARCH-BY-ID rescue (works when the watch page
        is throttled or the player is login-gated).
+       v1.8: that rescue now races in parallel FROM THE START (4 tiers)
+       and the settle window is shorter (1.3s) — metadata loads faster.
      - /__yt/home             → JSON { videos:[...] } (popular feed)
      - /__yt/channel?id=|handle= → JSON { header, videos:[...] }
        v1.6: ABSOLUTE-LATEST channel videos — innertube /browse (API,
@@ -25,6 +27,7 @@
        epoch-sorted newest-first. Every video carries `published` (ms).
        v1.7: + the channel's UPLOADS PLAYLIST (UU…) tier — the most
        title-reliable source (fixes blank titles, e.g. LTT).
+       v1.8: shorter grace window (2s) + EDGE CACHING (see below).
      - /__yt/dl?id=VID&type=audio|video → streams the file through this
        worker (Content-Disposition: attachment) so the browser downloads
        it directly from YOUR worker — no external site needed.
@@ -48,7 +51,26 @@
        land back inside the proxy. The worker root IS the converter:
        just open https://YOUR.WORKER/ and ezconv appears, unblocked.
 
-   WHAT CHANGED IN v1.7 (blank-title channels + metadata rescue):
+   WHAT CHANGED IN v1.8 (speed):
+     1. EDGE CACHING — search / video / home / channel JSON responses
+        are now stored in the Cloudflare Cache API (caches.default) in
+        addition to the per-isolate memory cache. The edge cache lives
+        across isolates at your colo, so a cold isolate still answers
+        instantly for anything fetched in the last few minutes (repeated
+        visits, channel hopping, subs refresh). TTLs: search 10 min,
+        video 3 min, home 5 min, channel 5 min.
+     2. /__yt/video — the search-by-ID rescue now RACES IN PARALLEL
+        with the other three tiers instead of running sequentially after
+        them, and the settle window dropped 2s → 1.3s. When the watch
+        scrape is 429-throttled (typical on datacenter IPs), the answer
+        now arrives in well under a second instead of after a 2s+ wait.
+     3. /__yt/channel — the tier-merge grace window dropped 3.4s → 2s:
+        browse + RSS + uploads all land within ~1s; only the slow scrape
+        / Piped tiers get cut early, and they only add fill data.
+     (Pair this worker with app v1.8, which paints the player instantly,
+      renders channels from a session cache and revalidates silently.)
+
+  WHAT CHANGED IN v1.7 (blank-title channels + metadata rescue):
      1. CHANNELS — a 5th parallel tier: the channel's UPLOADS PLAYLIST
         (UU…, innertube /browse with VL prefix). Every channel maintains
         this playlist automatically and it is newest-first with items
@@ -193,7 +215,7 @@
    ===================================================================== */
 
 /* ----- version + config -------------------------------------------- */
-const VERSION = '1.7';
+const VERSION = '1.8';
 const HEALTH_TAG = 'yt-only-ok/' + VERSION;
 const YT_HOME = 'https://www.youtube.com';
 
@@ -366,7 +388,7 @@ async function handleRequest(request) {
       const q = (url.searchParams.get('q') || '').trim();
       if (!q) return json({ error: 'missing q', videos: [], channels: [] });
       const cacheKey = 'search:' + q.toLowerCase();
-      const hit = cacheGet(cacheKey);
+      const hit = await cacheAnyGet(cacheKey); /* v1.8: memory → edge */
       if (hit) return json(hit);
       const result = await raceTiers([
         async () => {
@@ -393,7 +415,7 @@ async function handleRequest(request) {
         },
       ], { settleMs: 1800, minRich: 25, rank: x => (x.videos || []).length });
       if (result && result.videos && result.videos.length) {
-        cacheSet(cacheKey, result, 600000);
+        cacheBothSet(cacheKey, result, 600000); /* v1.8: memory + edge */
         return json(result);
       }
       return json({ query: q, videos: [], channels: [], error: 'no source answered — try again' }, { status: 502 });
@@ -406,15 +428,19 @@ async function handleRequest(request) {
      *      related via /next
      *   3) Piped /streams — independent path, full channel info
      * First "rich" answer wins instantly; otherwise the best of whatever
-     * arrived within ~2s. The v1.4 sequential chain could burn 20s+ on
-     * a throttled scrape before reaching the fallbacks ("metadata
-     * fails to load"). The search-by-ID scrape + oEmbed stay as last
-     * sequential rescues. */
+     * arrived within ~1.3s (v1.8: was 2s). The v1.4 sequential chain
+     * could burn 20s+ on a throttled scrape before reaching the
+     * fallbacks ("metadata fails to load").
+     * v1.8: the throttle-proof SEARCH-BY-ID tier (v1.7's rescue) now
+     * RACES FROM THE START as a 4th tier — when /watch is 429'd and the
+     * player is LOGIN_REQUIRED, the title/channel answer used to wait
+     * for a 2s race + a sequential rescue; now it's just there. The
+     * scrape-by-ID + oEmbed stay as last sequential rescues. */
     if (path === '/__yt/video') {
       const id = (url.searchParams.get('id') || '').trim();
       if (!id) return json({ error: 'missing id' });
       const cacheKey = 'video:' + id;
-      const hit = cacheGet(cacheKey);
+      const hit = await cacheAnyGet(cacheKey); /* v1.8: memory → edge */
       if (hit) return json(hit);
       const rank = d => (d && d.title ? 100 : 0) + ((d && d.related) ? d.related.length : 0) +
         ((d && d.channel && d.channel.avatar) ? 10 : 0) + ((d && d.channel && d.channel.subs) ? 5 : 0);
@@ -439,20 +465,20 @@ async function handleRequest(request) {
           if (pd && pd.title) return pipedToVideo(pd, id);
           throw new Error('piped empty');
         },
-      ], { settleMs: 2000, minRich: 130, rank });
-      /* rescue tiers (v1.7 order = cheapest + throttle-proof first):
-       *   1. innertube SEARCH BY ID — an API call; answers even when
-       *      /watch is 429'd or the player is LOGIN_REQUIRED (music /
-       *      age gates from datacenter IPs) — the "some metadata still
-       *      don't load" fix
-       *   2. search-by-ID HTML scrape (works when /watch is 429'd but
+        async () => {
+          /* v1.8: raced from the start (was a sequential rescue). Sparse
+             (no description/avatar) but throttle-proof + fast; its low
+             rank means it only wins when the richer tiers fail — which
+             is exactly when it's needed. */
+          const d = await innertubeSearchVideoMeta(id, 6000);
+          if (d && d.title) return d;
+          throw new Error('search-by-id empty');
+        },
+      ], { settleMs: 1300, minRich: 130, rank });
+      /* last sequential rescues (rare — all tiers above failed):
+       *   1. search-by-ID HTML scrape (works when /watch is 429'd but
        *      /results isn't)
-       *   3. oEmbed (nearly always up, sparse) */
-      if (!data || !data.title) {
-        try {
-          data = await innertubeSearchVideoMeta(id, 7000);
-        } catch (e) { /* keep going */ }
-      }
+       *   2. oEmbed (nearly always up, sparse) */
       if (!data || !data.title) {
         try {
           const html = await fetchUpstream(YT_HOME + '/results?search_query=' + encodeURIComponent(id) + '&hl=en&gl=US');
@@ -465,7 +491,7 @@ async function handleRequest(request) {
         } catch (e) { /* keep going */ }
       }
       if (data && (data.title || data.id)) {
-        cacheSet(cacheKey, data, 180000);
+        cacheBothSet(cacheKey, data, 180000); /* v1.8: memory + edge */
         return json(data);
       }
       return json({ error: 'video unavailable: no source answered' }, { status: 502 });
@@ -479,7 +505,7 @@ async function handleRequest(request) {
     /* home feed (popular playlist) ---------------------------------- *
      * v1.5: playlist scrape and Piped trending now race in parallel. */
     if (path === '/__yt/home') {
-      const hit = cacheGet('home:1');
+      const hit = await cacheAnyGet('home:1'); /* v1.8: memory → edge */
       if (hit) return json(hit);
       const result = await raceTiers([
         async () => {
@@ -495,7 +521,7 @@ async function handleRequest(request) {
         },
       ], { settleMs: 1800, minRich: 30, rank: x => (x.videos || []).length });
       if (result && result.videos && result.videos.length) {
-        cacheSet('home:1', result, 300000);
+        cacheBothSet('home:1', result, 300000); /* v1.8: memory + edge */
         return json(result);
       }
       return json({ videos: [] }, { status: 502 });
@@ -527,7 +553,7 @@ async function handleRequest(request) {
       if (!idParam && !handleParam) return json({ error: 'missing id or handle' });
 
       const cacheKey = 'channel:' + (idParam || handleParam);
-      const hit = cacheGet(cacheKey);
+      const hit = await cacheAnyGet(cacheKey); /* v1.8: memory → edge */
       if (hit) return json(hit);
 
       let resolvedId = idParam; /* may be filled in by handle resolution */
@@ -614,8 +640,10 @@ async function handleRequest(request) {
       );
       /* grace window (v1.5's search lesson): a hanging scrape must not
          stall an otherwise-instant browse+RSS answer — tiers that
-         haven't settled within the window are dropped from the merge */
-      const settled = (await settleWithin(jobs, 3400)).filter(Boolean);
+         haven't settled within the window are dropped from the merge.
+         v1.8: 3.4s → 2s — browse + RSS + uploads all land well inside
+         a second; only the slow scrape/Piped fill-tiers get cut early. */
+      const settled = (await settleWithin(jobs, 2000)).filter(Boolean);
       const byKind = k => settled.find(x => x.kind === k);
       const pipedS = byKind('piped');
       const scrapeS = byKind('scrape');
@@ -690,7 +718,7 @@ async function handleRequest(request) {
           header: h,
           videos: merged.slice(0, 30),
         };
-        cacheSet(cacheKey, out, 300000);
+        cacheBothSet(cacheKey, out, 300000); /* v1.8: memory + edge */
         return json(out);
       }
       return json({ error: 'channel unavailable — all five tiers (browse / RSS / uploads / scrape / Piped) failed. Try again in a moment.' }, { status: 502 });
@@ -1858,6 +1886,53 @@ function cacheSet(key, val, ttlMs) {
     }
     MEM_CACHE.set(key, { val, exp: Date.now() + (ttlMs || 60000) });
   } catch (e) { /* cache must never break a response */ }
+}
+
+/* ----- v1.8: edge cache (Cloudflare Cache API) --------------------- *
+ * The memory cache above is per-ISOLATE — a fresh isolate (cold start,
+ * busy colo) answers empty and every tier re-runs. caches.default is
+ * shared across isolates at the colo, so anything fetched in the last
+ * few minutes is served instantly no matter which isolate lands the
+ * request. The logical TTL is enforced by a timestamp stored INSIDE the
+ * body (the Cache API's own TTL handling is coarse); everything is
+ * wrapped in typeof guards + try/catch so environments without caches
+ * (local dev, tests) just skip the layer. */
+const EDGE_CACHE_URL = 'https://yt-only-edge.internal/__cache/';
+async function edgeGet(key) {
+  if (typeof caches === 'undefined' || !caches.default) return null;
+  try {
+    const hit = await caches.default.match(EDGE_CACHE_URL + encodeURIComponent(key));
+    if (!hit) return null;
+    const j = await hit.json();
+    if (!j || !j.__exp || Date.now() > j.__exp) return null; /* stale */
+    return j.d;
+  } catch (e) { return null; }
+}
+function edgePut(key, val, ttlMs) {
+  if (typeof caches === 'undefined' || !caches.default) return;
+  try {
+    const body = JSON.stringify({ __exp: Date.now() + (ttlMs || 60000), d: val });
+    const res = new Response(body, {
+      status: 200,
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=86400' },
+    });
+    const put = caches.default.put(EDGE_CACHE_URL + encodeURIComponent(key), res).catch(() => {});
+    if (EZ_CTX && EZ_CTX.waitUntil) { try { EZ_CTX.waitUntil(put); } catch (e) {} }
+    else void put;
+  } catch (e) { /* cache writes must never break a response */ }
+}
+/* read-through helper: memory → edge → null */
+async function cacheAnyGet(key) {
+  const m = cacheGet(key);
+  if (m) return m;
+  const e = await edgeGet(key);
+  if (e) { cacheSet(key, e, 30000); return e; } /* promote to memory for next time */
+  return null;
+}
+/* write-through helper: memory + edge */
+function cacheBothSet(key, val, ttlMs) {
+  cacheSet(key, val, ttlMs);
+  edgePut(key, val, ttlMs);
 }
 
 /* innertube: ANDROID_VR player call. Returns the raw player response
